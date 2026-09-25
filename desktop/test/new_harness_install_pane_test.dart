@@ -476,6 +476,11 @@ void main() {
       await tester.pump();
       await key(tester, LogicalKeyboardKey.enter, shift: true);
       await tester.pump();
+      expect(
+        find.byKey(const ValueKey('new-harness-progress')),
+        findsOneWidget,
+        reason: 'compact install progress keeps the busy action visible',
+      );
       notifier.narrate(_circuit.id, 'setup', line: 'npm ci');
       notifier.narrate(_circuit.id, 'failed', code: 'DSH_BUSY');
       notifier.pendingInstall!.complete('another install holds the lock');

@@ -474,8 +474,11 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
     WidgetsBinding.instance.scheduleFrame();
   }
 
+  bool _checkingLaunch = false;
+
   Future<void> _start() async {
     if (box.busy) return;
+    _checkingLaunch = box.checking;
     switch (await box.create()) {
       case NewHarnessOutcome.created:
         widget.onCreated();
@@ -509,7 +512,11 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
   /// taken first — it is what the person was looking at when they pressed
   /// it — and a door's prompt is finished the way Return finishes it.
   void _go() {
-    if (box.locked) return;
+    if (box.busy || box.linkingProfile) return;
+    if (box.checking) {
+      unawaited(_start());
+      return;
+    }
     if (_prompts.contains(box.field)) {
       box.accept();
     } else if (_picking) {
@@ -807,17 +814,15 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
                             ? _installPane(_installing!)
                             : _items(),
                       ),
-                      if (!_picking &&
-                          _installing == null &&
-                          (box.error != null || box.status != null))
+                      if (_installing != null)
                         Padding(
                           padding: EdgeInsets.fromLTRB(
-                            _margin * 2,
+                            _margin,
                             0,
-                            _margin * 2,
+                            _margin,
                             _rowHeight,
                           ),
-                          child: _status(),
+                          child: _buildButton(),
                         ),
                     ],
                   );
@@ -879,6 +884,11 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
             ),
           ),
         ),
+        if (box.error != null || box.status != null)
+          Padding(
+            padding: EdgeInsets.fromLTRB(_margin, _rowHeight, _margin, 0),
+            child: _status(),
+          ),
         _buildButton(),
       ],
     ),
@@ -890,8 +900,10 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
   /// one row tall — with the key that reaches it from anywhere printed
   /// beside it, so nobody has to walk down every field to find it.
   Widget _buildButton() {
-    final on = _row == _Row.start && !_picking;
-    final label = box.checking ? 'Check status' : 'New Harness';
+    final on = box.busy || (_row == _Row.start && !_picking);
+    final label = box.busy
+        ? (_checkingLaunch ? 'Checking...' : 'Starting...')
+        : (box.checking ? 'Check status' : 'New Harness');
     return Semantics(
       key: const ValueKey('new-harness-field-start'),
       container: true,
@@ -899,6 +911,7 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
       // The brackets and the key are how it LOOKS; a screen reader says
       // what it is.
       label: label,
+      liveRegion: box.busy,
       excludeSemantics: true,
       selected: on,
       enabled: !box.busy && !box.linkingProfile,
@@ -922,24 +935,31 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
               children: [
                 Flexible(
                   flex: 4,
-                  child: Text(
-                    '[ $label ]',
-                    maxLines: 1,
-                    softWrap: false,
-                    overflow: TextOverflow.clip,
-                    style: _ink(_theme.cursor),
-                  ),
+                  child: box.busy
+                      ? _LaunchProgress(
+                          label: label,
+                          style: _ink(_theme.cursor),
+                        )
+                      : Text(
+                          '[ $label ]',
+                          maxLines: 1,
+                          softWrap: false,
+                          overflow: TextOverflow.clip,
+                          style: _ink(_theme.cursor),
+                        ),
                 ),
-                SizedBox(width: _cell * 2),
-                Flexible(
-                  child: Text(
-                    _startKeyLabel,
-                    maxLines: 1,
-                    softWrap: false,
-                    overflow: TextOverflow.clip,
-                    style: _ink(_faint),
+                if (!box.busy) ...[
+                  SizedBox(width: _cell * 2),
+                  Flexible(
+                    child: Text(
+                      _startKeyLabel,
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.clip,
+                      style: _ink(_faint),
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ),
@@ -1019,7 +1039,7 @@ class _NewHarnessFormState extends State<NewHarnessForm> {
               ),
             ),
           ],
-          if (box.error != null || box.status != null) ...[
+          if (compact && (box.error != null || box.status != null)) ...[
             SizedBox(height: _rowHeight),
             _atTextColumn(_status()),
           ],
@@ -1558,4 +1578,51 @@ class _ElapsedState extends State<_Elapsed> {
       style: widget.style,
     );
   }
+}
+
+/// Animate only the busy action, at terminal speed, without rebuilding the form.
+class _LaunchProgress extends StatefulWidget {
+  const _LaunchProgress({required this.label, required this.style});
+
+  final String label;
+  final TextStyle style;
+
+  @override
+  State<_LaunchProgress> createState() => _LaunchProgressState();
+}
+
+class _LaunchProgressState extends State<_LaunchProgress> {
+  static const _frames = ['|', '/', '-', '\\'];
+  Timer? _timer;
+  int _frame = 0;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (MediaQuery.disableAnimationsOf(context) ||
+        !TickerMode.valuesOf(context).enabled) {
+      _timer?.cancel();
+      _timer = null;
+    } else {
+      _timer ??= Timer.periodic(const Duration(milliseconds: 160), (_) {
+        setState(() => _frame = (_frame + 1) % _frames.length);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Text(
+    '[ ${_frames[_frame]} ${widget.label} ]',
+    key: const ValueKey('new-harness-progress'),
+    maxLines: 1,
+    softWrap: false,
+    overflow: TextOverflow.clip,
+    style: widget.style,
+  );
 }

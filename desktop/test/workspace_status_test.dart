@@ -775,10 +775,25 @@ void main() {
           tester.view.physicalSize = Size(width, 800);
           await tester.pump(const Duration(milliseconds: 100));
           expect(tester.takeException(), isNull);
-          final rects = tools.map(tester.getRect).toList();
-          expect(tester.getRect(context).right, lessThan(rects.first.left));
-          expect(rects.last.right, lessThan(width));
-          final paragraphs = tools
+          final companion = tester.getRect(
+            find.byKey(const ValueKey('companion-tab-button')),
+          );
+          final visibleTools = tools
+              .where((tool) => tool.evaluate().isNotEmpty)
+              .toList();
+          final rects = visibleTools.map(tester.getRect).toList();
+          expect(
+            tester.getRect(context).right,
+            lessThan(rects.isEmpty ? companion.left : rects.first.left),
+          );
+          expect(companion.right, lessThan(width));
+          expect(visibleTools.length, anyOf(0, 4));
+          if (rects.isNotEmpty) {
+            expect(companion.left, closeTo(rects.last.right, .01));
+            expect(companion.height, closeTo(rects.last.height, .01));
+            expect(companion.center.dy, closeTo(rects.last.center.dy, .01));
+          }
+          final paragraphs = visibleTools
               .map(
                 (tool) => tester.renderObject<RenderParagraph>(
                   find.descendant(of: tool, matching: find.byType(RichText)),

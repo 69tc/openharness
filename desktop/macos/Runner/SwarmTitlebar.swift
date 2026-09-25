@@ -61,6 +61,9 @@ final class SwarmTitlebar: NSObject, NSMenuItemValidation, NSMenuDelegate {
         let state = call.arguments as? [String: Any] ?? [:]
         self.updateMachines(state["machines"] as? [[String: Any]] ?? [])
         result(nil)
+      case "companionState":
+        self.strip.updateCompanion(call.arguments as? [String: Any] ?? [:])
+        result(nil)
       case "playAlert":
         // A named macOS system sound. Every Mac has these, so no audio asset ships with the app,
         // nothing has to be decoded, and the alert plays at whatever volume the person has set for
@@ -102,7 +105,7 @@ final class SwarmTitlebar: NSObject, NSMenuItemValidation, NSMenuDelegate {
   }
 
   private func sendTabAction(_ method: String, arguments: Any?) {
-    guard ["focusedModel", "focusedContext", "harnessControls", "machineControls", "modelControls", "select", "close", "new", "rename", "commands", "notifications", "store", "sessions", "models", "addAgent", "newAgent", "newTerminal", "cloneAgent", "restartAgent", "shareAgent", "toggleViewer", "toggleComposer", "movePaneToTab", "runLocalModel", "splitRight", "splitDown", "zoomPane", "pinPane", "machineDestination", "machineAgent", "manageMachines", "machineList"].contains(method) else {
+    guard ["companion", "focusedModel", "focusedContext", "harnessControls", "machineControls", "modelControls", "select", "close", "new", "rename", "commands", "notifications", "store", "sessions", "models", "addAgent", "newAgent", "newTerminal", "cloneAgent", "restartAgent", "shareAgent", "toggleViewer", "toggleComposer", "movePaneToTab", "runLocalModel", "splitRight", "splitDown", "zoomPane", "pinPane", "machineDestination", "machineAgent", "manageMachines", "machineList"].contains(method) else {
       channel.invokeMethod(method, arguments: arguments)
       return
     }
@@ -1129,6 +1132,34 @@ private final class SwarmContextButton: SwarmIconButton {
   }
 }
 
+/// Plain terminal symbols with fixed cell gutters, also used by the companion.
+private final class SwarmSymbolButton: SwarmIconButton {
+  var glyph = "\\_O_/"
+  var columns = 8
+  var opacity: CGFloat = 0.55
+  var animating = false
+  var foreground = NSColor.white
+  var selection = NSColor(white: 0.35, alpha: 1)
+  private var textFont: NSFont { font ?? NSFont.monospacedSystemFont(ofSize: 13, weight: .regular) }
+  var preferredWidth: CGFloat {
+    ceil(("m" as NSString).size(withAttributes: [.font: textFont]).width) * CGFloat(columns + 2)
+  }
+
+  override func draw(_ dirtyRect: NSRect) {
+    let ink = foreground.withAlphaComponent(isEnabled || animating ? opacity : 0.35)
+    let attributes: [NSAttributedString.Key: Any] = [.font: textFont, .foregroundColor: ink, .ligature: 0]
+    let size = (glyph as NSString).size(withAttributes: attributes)
+    let line = bounds
+    if isEnabled && state == .on {
+      selection.setFill(); line.fill()
+    } else if isEnabled && (hovered || hasKeyboardFocus || isHighlighted) {
+      selection.withAlphaComponent(0.5).setFill(); line.fill()
+    }
+    (glyph as NSString).draw(at: NSPoint(x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2),
+      withAttributes: attributes)
+  }
+}
+
 private final class SwarmTabStrip: NSView {
   private(set) var palette = SwarmNativePalette()
   var emit: ((String, Any?) -> Void)?
@@ -1144,6 +1175,7 @@ private final class SwarmTabStrip: NSView {
   fileprivate let modelsButton = SwarmStatusSymbolButton()
   fileprivate let storeButton = SwarmStatusSymbolButton()
   private var barFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+  fileprivate let companionButton = SwarmSymbolButton()
   private var terminalForeground = NSColor(white: 0.85, alpha: 1)
   private var terminalSelection = NSColor(white: 0.35, alpha: 1)
   private var tabs: [SwarmTabButton] = []
@@ -1221,8 +1253,15 @@ private final class SwarmTabStrip: NSView {
       control.isEnabled = false
       addSubview(control)
     }
+    companionButton.isBordered = false
+    companionButton.title = ""
+    companionButton.isHidden = true
+    companionButton.isEnabled = false
+    companionButton.target = self
+    companionButton.action = #selector(openCompanion)
+    addSubview(companionButton)
     setAccessibilityChildren([scroll, newButton, focusedModelButton, contextButton, pullRequestButton,
-      harnessesButton, machinesButton, modelsButton, storeButton])
+      harnessesButton, machinesButton, modelsButton, storeButton, companionButton])
     registerForDraggedTypes([swarmPasteboardType])
   }
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -1271,6 +1310,10 @@ private final class SwarmTabStrip: NSView {
     pullRequestButton.selection = terminalSelection
     pullRequestButton.update(state["pullRequest"] as? [String: Any], enabled: actionsEnabled)
     pullRequestButton.isHidden = state["pullRequest"] == nil
+    companionButton.font = barFont
+    companionButton.foreground = terminalForeground
+    companionButton.selection = terminalSelection
+    updateCompanion(state["companion"] as? [String: Any] ?? [:])
     let rows = state["tabs"] as? [[String: Any]] ?? []
     let nextActiveId = state["activeId"] as? String ?? ""
     revealActiveAfterLayout = revealActiveAfterLayout || nextActiveId != activeId
@@ -1306,6 +1349,7 @@ private final class SwarmTabStrip: NSView {
     // Moving frames alone leaves AppKit's child traversal in insertion order.
     document.setAccessibilityChildren(tabs)
     newButton.isEnabled = actionsEnabled
+    needsDisplay = true
     needsLayout = true
     layoutSubtreeIfNeeded()
     if ids != previousOrder {
@@ -1321,6 +1365,32 @@ private final class SwarmTabStrip: NSView {
     }
   }
 
+  func updateCompanion(_ state: [String: Any]) {
+    let wasHidden = companionButton.isHidden
+    let previousColumns = companionButton.columns
+    companionButton.isHidden = state["visible"] as? Bool != true
+    companionButton.isEnabled = actionsEnabled && !companionButton.isHidden && state["hatching"] as? Bool != true
+    companionButton.animating = state["hatching"] as? Bool == true
+    companionButton.state = state["open"] as? Bool == true ? .on : .off
+    companionButton.columns = 8
+    let glyph = state["glyph"] as? String ?? "\\_O_/"
+    companionButton.glyph = !glyph.isEmpty && glyph.count <= companionButton.columns &&
+      glyph.unicodeScalars.allSatisfy { $0.value >= 32 && $0.value <= 126 } ? glyph : "\\_O_/"
+    companionButton.foreground = statusColor(state["foreground"], fallback: terminalForeground)
+    companionButton.opacity = CGFloat(min(1, max(0.35, (state["opacity"] as? NSNumber)?.doubleValue ?? 1)))
+    let label = state["label"] as? String ?? "Hatch your companion"
+    let detail = state["detail"] as? String ?? ""
+    companionButton.toolTip = state["tooltip"] as? String ?? label + "\n" + detail
+    companionButton.setAccessibilityLabel(label)
+    companionButton.setAccessibilityValue("\(companionButton.state == .on ? "Expanded" : "Collapsed"), \(detail)")
+    companionButton.needsDisplay = true
+    if wasHidden != companionButton.isHidden || previousColumns != companionButton.columns {
+      needsLayout = true
+      needsDisplay = true
+      layoutSubtreeIfNeeded()
+    }
+  }
+
   override func layout() {
     super.layout()
     let active = tabs.first(where: { $0.swarmId == activeId })
@@ -1329,17 +1399,23 @@ private final class SwarmTabStrip: NSView {
     let previousDocumentSize = document.frame.size
     let cell = ceil(("m" as NSString).size(withAttributes: [.font: barFont]).width)
     let trailing = cell
-    let toolColumns = max(ceil(28 / cell), min(4, floor((bounds.width - cell * 9) / (cell * 4))))
-    let toolWidth = cell * toolColumns
+    let companionWidth = companionButton.isHidden ? 0 : companionButton.preferredWidth
+    let companionSpace = companionWidth
+    let showTools = bounds.width - companionSpace >= cell * 25
+    let toolColumns = max(ceil(28 / cell), min(4, floor((bounds.width - companionSpace - cell * 9) / (cell * 4))))
+    let toolWidth = showTools ? cell * toolColumns : 0
     let toolHeight = workspaceBarControlHeight(barFont)
-    let toolsX = bounds.width - trailing - toolWidth * 4
+    companionButton.frame = NSRect(x: bounds.width - trailing - companionWidth,
+      y: (bounds.height - toolHeight) / 2, width: companionWidth, height: toolHeight)
+    let toolsX = bounds.width - trailing - companionSpace - toolWidth * 4
     for (index, control) in [harnessesButton, machinesButton, modelsButton, storeButton].enumerated() {
+      control.isHidden = !showTools
       control.frame = NSRect(x: toolsX + CGFloat(index) * toolWidth,
         y: (bounds.height - toolHeight) / 2, width: toolWidth, height: toolHeight)
     }
     let statusRight = toolsX - cell * 2
     // Compact windows keep a scrolling tab list; context never overlaps it.
-    let available = max(0, bounds.width - toolWidth * 4 - cell * 9)
+    let available = max(0, bounds.width - toolWidth * 4 - cell * 9 - companionSpace)
     let widths = tabs.map { min($0.preferredWidth, available * 0.45) }
     let total = widths.reduce(0, +)
     let occupied = min(total, available * 0.45)
@@ -1381,7 +1457,6 @@ private final class SwarmTabStrip: NSView {
     // A fine rule joins the flat tabs to the workspace.
     palette.workspace.setFill()
     NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
-
   }
   override func mouseDown(with event: NSEvent) {
     if ownsBackgroundDoubleClick(event) { window?.performZoom(nil) }
@@ -1409,6 +1484,9 @@ private final class SwarmTabStrip: NSView {
           let paneId = focusedModelTarget?["paneId"] as? Int,
           let agentId = focusedModelTarget?["agentId"] as? String else { return }
     emit?("focusedModel", ["paneId": paneId, "agentId": agentId])
+  }
+  @objc private func openCompanion() {
+    if actionsEnabled && companionButton.isEnabled { emit?("companion", nil) }
   }
   @objc private func openFocusedPullRequest() {
     if actionsEnabled && pullRequestButton.isEnabled, let url = pullRequestButton.actionURL {
