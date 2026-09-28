@@ -38,7 +38,15 @@ export interface PairedClient {
   label: string       // UA-derived, for display
   pairedAt: number
   role: PairRole      // old records without this field are treated as web
+  /** Set for a peer that joined over the remote password (or was learned from a trust-group sync): the
+   *  joining machine's id when `kind` is 'machine', absent for a viewer app. Absent on older records. */
+  machineId?: string
+  kind?: PeerKind
 }
+
+/** What a password-linked peer is: another harness machine (which also serves, so it can be dialed back)
+ *  or a viewer app (mobile / viewer desktop — dial-out only). */
+export type PeerKind = 'machine' | 'viewer'
 function writeSecure(file: string, data: unknown): void {
   mkdirSync(DIR, { recursive: true, mode: 0o700 })
   writeFileSync(file, JSON.stringify(data, null, 2), { mode: 0o600 })
@@ -104,8 +112,16 @@ export class E2eeStore {
     return this.paired.get(identityPubB64)?.label ?? null
   }
 
-  addPaired(identityPubB64: string, label: string, at: number, role: PairRole = 'web'): void {
-    this.paired.set(identityPubB64, { identityPub: identityPubB64, label, pairedAt: at, role })
+  pairedPeer(identityPubB64: string): PairedClient | null {
+    return this.paired.get(identityPubB64) ?? null
+  }
+
+  addPaired(identityPubB64: string, label: string, at: number, role: PairRole = 'web', peer?: { machineId?: string; kind?: PeerKind }): void {
+    this.paired.set(identityPubB64, {
+      identityPub: identityPubB64, label, pairedAt: at, role,
+      ...(peer?.machineId ? { machineId: peer.machineId } : {}),
+      ...(peer?.kind ? { kind: peer.kind } : {}),
+    })
     writeSecure(PAIRED_FILE, [...this.paired.values()])
   }
 
@@ -179,6 +195,9 @@ export class E2eeStore {
     const record = this.remotePassword
     if (!record) return { lockedUntil: null }
     const now = Date.now()
+    // The backoff escalates across lockouts only while they keep coming: a quiet day since the last one
+    // ended starts it over, so no one is held at the 24h ceiling for good.
+    if (record.lockedUntil && now - record.lockedUntil > PW_LOCKOUT_MAX_MS) record.lockoutCount = 0
     record.recentFailures = [...record.recentFailures.filter((t) => now - t < PW_FAIL_WINDOW_MS), now]
     if (record.recentFailures.length >= PW_FAIL_THRESHOLD) {
       const count = (record.lockoutCount ?? 0) + 1
@@ -190,11 +209,15 @@ export class E2eeStore {
     return { lockedUntil: record.lockedUntil ?? null }
   }
 
-  /** Successful attempts don't affect the failure count — mirrors manager.ts's `attempts` convention
-   *  for the live pairing code (only failed handshakes count toward its rate limit). Kept as an
-   *  explicit no-op call site (rather than omitted) so the success path in manager.ts reads the same
-   *  shape as the failure path, and so a future policy change has one place to land. */
-  notePwSuccess(): void { /* deliberately no-op — see doc comment */ }
+  /** A successful pairing proves the password is known to its owner's machines: the failures and the
+   *  lockout escalation that came before it no longer describe anyone's guessing, so both start over. */
+  notePwSuccess(): void {
+    const record = this.remotePassword
+    if (!record || (record.recentFailures.length === 0 && !record.lockoutCount)) return
+    record.recentFailures = []
+    record.lockoutCount = 0
+    writeSecure(REMOTE_PASSWORD_FILE, record)
+  }
 
   /** Current lockout, or null if unset/expired. An expired `lockedUntil` is treated as not-locked
    *  without rewriting the file — the next real failure (if any) will naturally recompute it. */

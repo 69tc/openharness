@@ -84,6 +84,46 @@ describe('process-owned hook server', () => {
     expect(handlers.onRegistered).not.toHaveBeenCalled()
   })
 
+  it('accepts a Herdr hint from a hook installed by an earlier build, and resolves by its tmux pane only', async () => {
+    const resolveHookAgent = vi.fn(async () => null)
+    const { base, headers } = await start({ resolveHookAgent })
+    const response = await fetch(`${base}/api/hook/session-start`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        engine: 'codex',
+        tmuxPane: '%41',
+        sessionId: '019fea92-e31a-7692-9c35-f616e9d458b7',
+        runtimeHints: [
+          { backend: 'tmux', paneId: '%41' },
+          { backend: 'herdr', paneId: 'w1:p1', sessionName: 'default', socketPath: '/tmp/herdr.sock' },
+        ],
+      }),
+    })
+
+    expect(response.status).toBe(200)
+    expect(resolveHookAgent).toHaveBeenCalledWith({
+      engine: 'codex', tmuxPane: '%41', runtimeHints: [{ backend: 'tmux', paneId: '%41' }], callerPid: undefined,
+    })
+  })
+
+  it('ignores a hook whose only terminal is a Herdr pane', async () => {
+    const resolveHookAgent = vi.fn(async () => null)
+    const { base, headers } = await start({ resolveHookAgent })
+    const response = await fetch(`${base}/api/hook/session-start`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        engine: 'claude',
+        sessionId: 'session-1',
+        runtimeHints: [{ backend: 'herdr', paneId: 'w1:p1', sessionName: 'default' }],
+      }),
+    })
+
+    expect(await response.json()).toEqual({ ignored: true, reason: 'not_in_terminal' })
+    expect(resolveHookAgent).not.toHaveBeenCalled()
+  })
+
   it('rejects hooks outside configured terminal contexts before attempting process resolution', async () => {
     const resolveHookAgent = vi.fn(async () => null)
     const { handlers, base, headers } = await start({ resolveHookAgent })
@@ -355,6 +395,14 @@ describe('requests must name this server', () => {
     expect(onLogs).not.toHaveBeenCalled()
   })
 
+  it('serves a status that has to read before it answers', async () => {
+    // A harness's `updatedAt` is when its conversation last moved, which is read from its transcript.
+    const { base } = await start({ onStatus: async () => ({ sessions: [{ id: 'a', updatedAt: 42 }] }) })
+    const res = await fetch(`${base}/api/status`)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ sessions: [{ id: 'a', updatedAt: 42 }] })
+  })
+
   it('still serves loopback names, and the dashboard from its own origin', async () => {
     const { base } = await start({ onStatus: () => ({ ok: true }) })
     const port = new URL(base).port
@@ -363,5 +411,113 @@ describe('requests must name this server', () => {
     }
     expect(await send(base, 'GET', '/api/status', { host: `localhost:${port}`, origin: `http://localhost:${port}` })).toBe(200)
     expect(await send(base, 'GET', '/api/status', { host: `127.0.0.1:${port}`, origin: 'http://evil.example' })).toBe(403)
+  })
+})
+
+describe('the trust group endpoints', () => {
+  const local = { 'x-adapter-local': '1', 'content-type': 'application/json' }
+  const key = Buffer.alloc(32, 7).toString('base64')
+  const machineId = 'a'.repeat(32)
+
+  it('trust-peer takes only a real key and machine id, and trims the label', async () => {
+    const onTrustLinkedPeer = vi.fn(() => ({ status: 200, body: { ok: true } }))
+    const { base } = await start({ onTrustLinkedPeer })
+    const post = (body: unknown, headers: Record<string, string> = local) =>
+      fetch(`${base}/api/link/trust-peer`, { method: 'POST', headers, body: JSON.stringify(body) })
+    for (const bad of [{ pub: 'x', machineId }, { pub: key, machineId: 'nope' }, { machineId }, { pub: `${key}AA`, machineId }]) {
+      expect((await post(bad)).status, JSON.stringify(bad)).toBe(400)
+    }
+    expect((await post({ pub: key, machineId }, { 'content-type': 'application/json' })).status).toBe(403)
+    expect((await post({ pub: key, machineId, label: `  ${'n'.repeat(80)} ` })).status).toBe(200)
+    expect(onTrustLinkedPeer).toHaveBeenCalledTimes(1)
+    expect(onTrustLinkedPeer).toHaveBeenCalledWith({ pub: key, machineId, label: 'n'.repeat(60) })
+  })
+
+  it('group remove and sync are local writes; list is readable', async () => {
+    const onGroupRemove = vi.fn(() => ({ status: 200, body: { label: 'b', fingerprint: 'fp' } }))
+    const onGroupSync = vi.fn(() => ({ status: 200, body: { ok: true } }))
+    const onGroupList = vi.fn(() => ({ status: 200, body: { members: [] } }))
+    const { base } = await start({ onGroupRemove, onGroupSync, onGroupList })
+    expect((await fetch(`${base}/api/group/remove`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"selector":"1"}' })).status).toBe(403)
+    expect((await fetch(`${base}/api/group/sync`, { method: 'POST' })).status).toBe(403)
+    expect((await fetch(`${base}/api/group/remove`, { method: 'POST', headers: local, body: '{"selector":"  "}' })).status).toBe(400)
+    expect((await fetch(`${base}/api/group/remove`, { method: 'POST', headers: local, body: '{"selector":" 1 "}' })).status).toBe(200)
+    expect(onGroupRemove).toHaveBeenCalledWith('1')
+    expect((await fetch(`${base}/api/group/sync`, { method: 'POST', headers: local })).status).toBe(200)
+    expect(await (await fetch(`${base}/api/group`)).json()).toEqual({ members: [] })
+  })
+})
+
+describe('the daemon socket', () => {
+  function viaSocket(socketPath: string, method: string, path: string, headers: Record<string, string> = {}): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const r = request({ socketPath, path, method, headers }, (res) => { res.resume(); resolve(res.statusCode ?? 0) })
+      r.on('error', reject)
+      r.end()
+    })
+  }
+
+  it('serves the same routes with no loopback Host, and keeps every other guard', async () => {
+    const dir = mkdtempSync('/tmp/hsock-')
+    const socketPath = join(dir, 'daemon.sock')
+    const onStatus = vi.fn(() => ({ ok: true }))
+    const commandBar = { status: vi.fn(async () => ({ configured: false })), decide: vi.fn() }
+    const started = await startHookServer(0, { onRegistered: vi.fn(), onSessionEnd: vi.fn(), onStatus, onCommandBar: commandBar as never }, { socketPath })
+    server = started.server
+    try {
+      expect(started.localSocket?.path).toBe(socketPath)
+      // Node sends `Host: localhost` without a port over a socket — refused on TCP, fine here.
+      expect(await viaSocket(socketPath, 'GET', '/api/status')).toBe(200)
+      expect(await viaSocket(socketPath, 'GET', '/api/status', { host: 'rebind.evil.example' })).toBe(200)
+      expect(onStatus).toHaveBeenCalledTimes(2)
+      // The command bar asked for a loopback PEER; a socket peer has no address and is let in.
+      expect(await viaSocket(socketPath, 'GET', '/api/command-bar/status', { 'x-adapter-local': '1' })).toBe(200)
+      expect(await viaSocket(socketPath, 'GET', '/api/command-bar/status')).toBe(403)
+      // Mutations still need the CSRF header, hooks still need their credential.
+      expect(await viaSocket(socketPath, 'POST', '/api/stop')).toBe(403)
+      expect(await viaSocket(socketPath, 'POST', '/api/hook/session-start')).not.toBe(200)
+      // The TCP port is untouched: a foreign Host is still refused there.
+      const port = (started.server.address() as { port: number }).port
+      const tcp = await new Promise<number>((resolve, reject) => {
+        const r = request({ host: '127.0.0.1', port, path: '/api/status', headers: { host: 'rebind.evil.example' } }, (res) => { res.resume(); resolve(res.statusCode ?? 0) })
+        r.on('error', reject)
+        r.end()
+      })
+      expect(tcp).toBe(403)
+    } finally {
+      await started.localSocket?.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('hands out a phone sign-in code over the socket only — never on the loopback port', async () => {
+    const dir = mkdtempSync('/tmp/hsock-')
+    const socketPath = join(dir, 'daemon.sock')
+    const onAuthHandoff = vi.fn(async () => ({ status: 200, body: { success: true, data: { code: 'hnh_x', expiresIn: 90 } } }))
+    const started = await startHookServer(0, { onRegistered: vi.fn(), onSessionEnd: vi.fn(), onAuthHandoff }, { socketPath })
+    server = started.server
+    try {
+      const local = { 'x-adapter-local': '1' }
+      expect(await viaSocket(socketPath, 'POST', '/api/auth/handoff', local)).toBe(200)
+      expect(await viaSocket(socketPath, 'POST', '/api/auth/handoff')).toBe(403)
+      const port = (started.server.address() as { port: number }).port
+      const tcp = await fetch(`http://127.0.0.1:${port}/api/auth/handoff`, { method: 'POST', headers: local })
+      expect(tcp.status).toBe(403)
+      expect(onAuthHandoff).toHaveBeenCalledTimes(1)
+    } finally {
+      await started.localSocket?.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('starts on TCP alone when the socket cannot be opened', async () => {
+    const dir = mkdtempSync('/tmp/hsock-')
+    const blocked = join(dir, 'daemon.sock')
+    writeFileSync(blocked, 'not a socket')
+    const started = await startHookServer(0, { onRegistered: vi.fn(), onSessionEnd: vi.fn() }, { socketPath: blocked })
+    server = started.server
+    expect(started.localSocket).toBeNull()
+    expect(started.port).toBeGreaterThan(0)
+    rmSync(dir, { recursive: true, force: true })
   })
 })

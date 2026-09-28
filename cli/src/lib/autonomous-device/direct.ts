@@ -56,18 +56,13 @@ export class AutonomousDeviceDirect {
     this.pairing = true
     let success = false
     try {
-      // Snapshot the last-known candidate BEFORE discover() clears the map. A
-      // flaky mDNS round (bonjour-service occasionally misses a single answer
-      // in the 3s browse window) would otherwise wipe a device the caller had
-      // just picked from the immediately preceding discovery, and pair fails
-      // with DEVICE_NOT_FOUND on a device that is actually still there.
-      const stashed = this.candidates.get(device)
+      // A single missed mDNS response must not erase the endpoint the user just selected.
+      // Fresh discovery wins when it has an address; pairing still authenticates the device.
+      const previous = this.candidates.get(device)
       await this.discover()
-      const candidate = this.candidates.get(device) ?? stashed
+      const candidate = this.candidates.get(device) ?? previous
       if (!candidate) throw Object.assign(new Error('Selected device is no longer discoverable'), { code: 'DEVICE_NOT_FOUND' })
-      // Keep the resolved candidate available for reconnect() until the caller
-      // completes or aborts pairing, so a follow-up call finds it too.
-      if (!this.candidates.has(device)) this.candidates.set(device, candidate)
+      this.candidates.set(device, candidate)
       const old = this.links.get(device); if (old) { old.ws.terminate(); this.links.delete(device) }
       await this.connect(candidate, true)
       const link = this.links.get(device)!

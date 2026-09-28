@@ -4,6 +4,7 @@ import { createDeviceStore, deviceStoreAgents } from './lib/autonomous-device/st
 import { mutateDsh } from './dsh/service.js'
 import { HarnessShareOwner } from './sharing/owner.js'
 import { HarnessGrantStore } from './sharing/grants.js'
+import { HarnessCollaborationStore } from './sharing/collaboration.js'
 import { HarnessShareRelay, type SharedMachineReference } from './sharing/relay.js'
 import { SharedViewerPool } from './sharing/viewer.js'
 import { fingerprint as e2eeCoreFingerprint, b64d as e2eeCoreDecode } from './lib/e2ee/core.js'
@@ -24,7 +25,7 @@ import { AutonomousDeviceDirect } from './lib/autonomous-device/direct.js'
  */
 
 import 'dotenv/config'
-import { readFileSync, writeFileSync, mkdirSync, openSync, existsSync, rmSync, statSync } from 'fs'
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, openSync, existsSync, rmSync, statSync } from 'fs'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
@@ -42,6 +43,7 @@ import { DialLog } from './cable/dialLog.js'
 import { buildLogBundle, bundleFileName, redactSecretsInText } from './lib/logBundle.js'
 import { CableSession } from './cable/cableSession.js'
 import { DaemonCableHost, cableEventFor, cableQuestionFor, cableQuestionCloseFor } from './cable/cableHost.js'
+import { terminalActivity } from './cable/terminalActivity.js'
 
 import { MachineListCache, machineListCachePath, withStaleMarker } from './device/machineList.js'
 import { DeviceLink } from './device/deviceLink.js'
@@ -74,7 +76,7 @@ import { gridAvailable } from './lib/gridExec.js'
 import { ENGINE_CLI_COMMANDS, ENGINES, PROCESS_ENGINES, engineBin, enginePathOverride } from './lib/engineBin.js'
 import { isTerminalEngine, type AgentEngine } from './engines/types.js'
 import { engineInstallRecipe } from './lib/engineInstall.js'
-import { buildEngineCommandArgv, buildEngineLaunchArgv, commandAvailableInInteractiveShell, dropPermissionFlagIfUnsupported, namedAgentArgs, permissionModeApproves, permissionModeFlags, refusePermissionFlagIfUnsupported } from './lib/engineLaunch.js'
+import { buildEngineCommandArgv, buildEngineLaunchArgv, commandAvailableInInteractiveShell, dropPermissionFlagIfUnsupported, namedAgentArgs, permissionModeApproves, permissionModeFlags, refusePermissionFlagIfUnsupported, supportsFirstPrompt } from './lib/engineLaunch.js'
 import { workspaceMissing } from './lib/workspaceCheck.js'
 import { buildGridEngineLaunch, describeGridLaunch, gridConflictingEnvToClear, gridEnvVarNames, type GridLaunchMachine, type GridWebSearchStatus } from './lib/gridLaunch.js'
 import { HERMES_SYSTEM_MANAGED_DIR } from './lib/gridWebMcp.js'
@@ -93,6 +95,12 @@ import { restoreAgents } from './lib/restoreAgents.js'
 import { createRetainExitedSession } from './lib/retainExitedSession.js'
 import { repairClaudeCwd } from './lib/cwdRepair.js'
 import { stoppedAgents } from './lib/stoppedAgents.js'
+import { SessionSearchIndex, folderWords, type SearchSource } from './lib/sessionSearch/indexer.js'
+import { ExternalSessions, OpenSessions, processAlive, stopSessionOwner, type SessionOwner } from './lib/sessionSearch/external.js'
+import { externalProviders } from './lib/sessionSearch/externals/index.js'
+import { engineLabel } from './lib/agentNames.js'
+import { SessionSearchStore } from './lib/sessionSearch/store.js'
+import { SESSION_SEARCH_FILE, searchCommand } from './lib/sessionSearch/command.js'
 import { sweepWorktrees } from './lib/worktreeSweep.js'
 import { nameBranchAfterSession } from './lib/branchNaming.js'
 import { forgetAgentProject } from './lib/agentProject.js'
@@ -124,17 +132,8 @@ import {
   permissionModeFromArgv,
   clearPaneRemainOnExit,
   resolvePaneEngineProcess,
-  checkSessionRuntime,
   tmuxPaneState,
 } from './lib/tmux.js'
-import { HerdrBackend } from './lib/herdrBackend.js'
-import {
-  discoverRunningHerdrSessions,
-  herdrHintSelects,
-  listInstalledHerdrSessions,
-  resolveConfiguredHerdrSessions,
-  type HerdrTargetResolution,
-} from './lib/herdrSessions.js'
 import { ALL_TERMINAL_BACKENDS } from './config/terminalConfig.js'
 import { TerminalBackendCoordinator } from './lib/terminalBackendCoordinator.js'
 import { TerminalStreamManager } from './lib/terminalStreamManager.js'
@@ -142,18 +141,18 @@ import { terminalRouteKey, terminalRuntimeLabel } from './lib/terminalRuntime.js
 import { TerminalAgentReconciler } from './lib/terminalAgentReconciler.js'
 import { processRows, type DiscoveredTerminalAgent } from './lib/terminalAgentDiscovery.js'
 import { remoteCommand } from './remoteCommand.js'
+import { tuiCommand } from './tui/index.js'
 import { newCommand } from './lib/newCommand.js'
 import { WebSocket as NewCommandSocket } from 'ws'
 import {
   terminalActionNotStarted,
-  type HookTerminalHint,
   type TerminalActionResult,
   type TerminalRuntimeRef,
   type TmuxRuntimeRef,
 } from './lib/terminalTypes.js'
-import { readTerminalConfigSnapshot, writeTerminalConfigSnapshot } from './lib/terminalConfigSnapshot.js'
 import { Watcher, type HistoryEvent, type LineEvent } from './watcher/watcher.js'
 import { chooseHookAgent, startHookServer } from './hookServer.js'
+import { isLocalSocketName, localSocketPath, type LocalSocketServer } from './lib/localSocket.js'
 import { commandBarService } from './lib/commandBar.js'
 import { BackendSocket, isLocalClientId } from './backendSocket.js'
 import { AutonomousDeviceService } from './lib/autonomous-device/service.js'
@@ -161,6 +160,9 @@ import { autonomousDeviceLocalRequest } from './lib/autonomous-device/localApi.j
 import { runAutonomousDeviceCommand } from './lib/autonomous-device/command.js'
 import { attachLocalWsServer, LOCAL_WS_PATH, LOCAL_WS_PROTOCOL_VERSION } from './localWsServer.js'
 import { createWindowRouter } from './cable/windowRoute.js'
+import { WindowSelection } from './cable/windowSelection.js'
+import { WindowVisit } from './cable/windowVisit.js'
+import { WindowForm } from './cable/windowForm.js'
 import { RemoteRelayPool } from './lib/remoteRelay.js'
 import { TERMINAL_BINARY_VERSION } from './lib/terminalBinary.js'
 import { foldTranscript, lastTurnTextFromRawLines, lineToEvents, newTurnState, type LiveEvent, type TurnState } from './lib/normalize.js'
@@ -180,7 +182,10 @@ import { E2eeStore } from './lib/e2ee/store.js'
 import { isLoopbackRequest, loopbackHosts } from './lib/loopbackRequest.js'
 import { b64e } from './lib/e2ee/core.js'
 import { MachinePeerStore } from './lib/e2ee/machinePeers.js'
-import { connectWithPassword } from './lib/e2ee/relayClient.js'
+import { connectWithPassword, type PwConnectProgress } from './lib/e2ee/relayClient.js'
+import type { LinkedPeer } from './lib/e2ee/manager.js'
+import { GroupSyncer, relayRequester, SELF_STAMP } from './lib/e2ee/groupSyncer.js'
+import { TrustGroupStore, type GroupMember } from './lib/e2ee/trustGroup.js'
 import {
   startSelfUpdater, restore as restoreUpdate, confirm as confirmUpdate,
   fetchManifest, downloadVerified, canary, stage, semverGt, isLocalDevBuild,
@@ -193,14 +198,15 @@ import { CodexNormalizer, codexTaskError, lastCodexTurnText } from './engines/co
 import { codexSubagentResolverFor } from './engines/codex/subagent.js'
 import { CursorNormalizer, lastCursorTurnText } from './engines/cursor/normalizer.js'
 import { CursorTranscriptDiscovery, findCursorTranscript } from './engines/cursor/discovery.js'
+import { cursorConfigDir, cursorDataDir } from './engines/cursor/home.js'
 import { CursorSubagentManager } from './engines/cursor/subagent.js'
 import { CursorTaskHookQueue } from './engines/cursor/taskHookQueue.js'
 import { loadCursorPendingTasks, removeCursorPendingTasks } from './engines/cursor/pendingTasks.js'
 import { OpencodeReader, readOpencodeMessages } from './engines/opencode/reader.js'
 import { opencodeModelFromArgv, setOpencodeSessionModel } from './engines/opencode/sessionModel.js'
-import { lastOpencodeTurnText } from './engines/opencode/normalizer.js'
+import { lastOpencodeTurnText, opencodeMessagesToEvents } from './engines/opencode/normalizer.js'
 import { KiloReader, readKiloMessages } from './engines/kilo/reader.js'
-import { lastKiloTurnText } from './engines/kilo/normalizer.js'
+import { kiloMessagesToEvents, lastKiloTurnText } from './engines/kilo/normalizer.js'
 import { MuseNormalizer, lastMuseTurnText, museMessagesToEvents } from './engines/muse/normalizer.js'
 import { AmpNormalizer, lastAmpTurnText, ampMessagesToEvents } from './engines/amp/normalizer.js'
 import { GrokNormalizer, lastGrokTurnText } from './engines/grok/normalizer.js'
@@ -214,8 +220,8 @@ import { PiNormalizer, lastPiTurnText } from './engines/pi/normalizer.js'
 import { HermesReader, readHermesMessages } from './engines/hermes/reader.js'
 import { hermesDbForSession } from './lib/hermesHome.js'
 import { DevinReader, readDevinMessages } from './engines/devin/reader.js'
-import { lastHermesTurnText } from './engines/hermes/normalizer.js'
-import { lastDevinTurnText } from './engines/devin/normalizer.js'
+import { hermesMessagesToEvents, lastHermesTurnText } from './engines/hermes/normalizer.js'
+import { devinMessagesToEvents, lastDevinTurnText } from './engines/devin/normalizer.js'
 import {
   CommandCodeNormalizer,
   commandCodeRunError,
@@ -224,7 +230,7 @@ import {
 } from './engines/commandcode/normalizer.js'
 import { probeGatewayRuntime } from './lib/gatewayRuntime.js'
 import { probeGridAssignment, sameGridAssignment } from './lib/gridAssignment.js'
-import { agentFrame, type AgentFrame } from './lib/agentFrame.js'
+import { agentFrame, lastActivityAt, type AgentFrame } from './lib/agentFrame.js'
 import { agentTokenUsage } from './lib/agentTokenUsage.js'
 import { SessionInputController } from './lib/sessionInput.js'
 import { DeviceResultJournal } from './lib/autonomous-device/resultJournal.js'
@@ -234,6 +240,7 @@ import { RuntimeProfileManager, parseRuntimeProfile } from './lib/runtimeProfile
 import { RuntimeProfileController, inspectRuntimePane } from './lib/runtimeProfileController.js'
 import { deviceErrorText } from './lib/deviceErrors.js'
 import { correlateAgentEvent, turnHeartbeatFrame } from './lib/agentEvent.js'
+import { transcriptIsFirstTurn } from './lib/firstTurnReplay.js'
 // Before ANY child is spawned: on Linux an absent locale makes tmux and ps mangle their output,
 // which silently costs the daemon every pane it would have discovered. See lib/childLocale.ts.
 ensureUtf8Locale()
@@ -373,9 +380,12 @@ Machine:
   harness reset                stop the adapter and clear local CLI state
   harness status               show whether it's running (+ version)
   harness logs export          zip the last 7 days of logs (app, CLI, dial, daemon) to the Desktop
+  harness tui                  all of Harness in this terminal: tabs, panes, every machine (⌥O ⌥P ⌥N)
   harness new [agent] [@machine] [folder|name] [-- task]
                                make a harness from a shell: \`harness new\` is claude here; see \`harness new -h\`
   harness machines             list the machines on this account (this computer's is marked)
+  harness search <words>       find the conversation on this computer that said them: every turn of
+                               every session, live or stopped (--limit=N, --json)
   harness machines delete <id> remove ANOTHER machine (refuses this one; use \`harness logout\`)
   harness remote               from a Harness terminal tile: open a terminal on another of your machines and move this tile to it
   harness version              print the installed version (v${VERSION})
@@ -414,6 +424,10 @@ every future connect, until you change or clear it:
                                (--name=<label> names the machine in messages instead of its id)
   harness link list            list machines this one has linked
   harness link unlink <id>     remove a linked machine's trust
+  harness group list           machines and phones that trust each other through links: link one
+                               machine and every member reaches it both ways, no more passwords
+  harness group sync           compare with every reachable member now (it also happens on its own)
+  harness group remove <id>    drop a member (machine id, # or fingerprint) from every member
   (both \`remote-password set\` and \`link connect\` prompt for the password interactively, or read one
   line from stdin with --stdin; add --json for NDJSON output instead of the human-readable text)
 
@@ -476,13 +490,15 @@ const daemonBoot: {
   updater: Poller | null
   /** The hook server, once bound — the only thing a mid-boot handoff has to release. */
   hookServer: Server | null
+  /** Its Unix-socket twin (lib/localSocket.ts), when one could be opened. Read by `/api/status`. */
+  localSocket: LocalSocketServer | null
   /** Set by the body so a failed boot can flip its own `/api/status` to not-ready. */
   markNotReady: ((reason: string) => void) | null
   /** Why this daemon is in safe mode, or null while it is healthy. Read by `/api/status`. */
   safeMode: string | null
   handingOff: boolean
   applyStagedUpdate: (version: string) => void | Promise<void>
-} = { updater: null, hookServer: null, markNotReady: null, safeMode: null, handingOff: false, applyStagedUpdate: bootHandoff }
+} = { updater: null, hookServer: null, localSocket: null, markNotReady: null, safeMode: null, handingOff: false, applyStagedUpdate: bootHandoff }
 
 /**
  * Hand the machine to a newer build without finishing start-up.
@@ -505,6 +521,7 @@ function bootHandoff(version: string): void {
     closeServer: () => {
       try { (daemonBoot.hookServer as unknown as { closeAllConnections?: () => void } | null)?.closeAllConnections?.() } catch { /* already gone */ }
       try { daemonBoot.hookServer?.close() } catch { /* already gone */ }
+      try { daemonBoot.localSocket?.closeSync() } catch { /* already gone */ }
     },
     // Only if it still names us — a no-op when start-up never got as far as claiming it.
     removePidFile: () => { removePidFileIf(process.pid) },
@@ -1456,28 +1473,12 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   await registry.transaction(() => {
     for (const session of registry.list()) registry.setActive(session.agentId, false)
   })
-  // Unset means AUTO: watch every backend usable on this machine. Herdr is retired, so that set is
-  // tmux and only tmux (see config/terminalConfig.ts) — `parseTerminalBackends` drops a `herdr` still
-  // named in someone's environment rather than refusing to boot on it.
-  //
-  // NB this deliberately mirrors `parseTerminalConfig` instead of calling it, and the two must not
-  // drift: both read ALL_TERMINAL_BACKENDS for the AUTO case.
+  // Unset means AUTO: watch every backend usable on this machine, which is tmux and only tmux (see
+  // config/terminalConfig.ts). `parseTerminalBackends` drops a retired `herdr` still named in someone's
+  // environment rather than refusing to boot on it.
   const backendsExplicit = env.TERMINAL_BACKENDS !== undefined
-  const herdrSessionsExplicit = env.HERDR_SESSIONS !== undefined
   const terminalConfig = {
     backends: env.TERMINAL_BACKENDS ?? ALL_TERMINAL_BACKENDS,
-    // Always empty: `backends` can no longer contain 'herdr', so every Herdr path below short-circuits
-    // and there is nothing left to name sessions for. HERDR_SESSIONS still parses so an existing
-    // environment does not fail boot; it simply selects nothing.
-    herdrSessions: [] as readonly string[],
-  }
-  /** The names in play right now: the operator's allowlist, or whatever Herdr currently reports. */
-  let activeHerdrSessions: readonly string[] = terminalConfig.herdrSessions
-  const resolveHerdrTargets = async (): Promise<HerdrTargetResolution[]> => {
-    if (!terminalConfig.backends.includes('herdr')) return []
-    return herdrSessionsExplicit
-      ? resolveConfiguredHerdrSessions(terminalConfig.herdrSessions, () => listInstalledHerdrSessions(env.HERDR_BIN))
-      : discoverRunningHerdrSessions(env.HERDR_BIN)
   }
   // Before ANY tmux call: a daemon that came up outside a terminal (the usual shape after a reboot)
   // has a minimal PATH, and every `execFile('tmux', …)` below would ENOENT. Ask the user's own login
@@ -1508,114 +1509,11 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   // reaches sessions created after it without rebuilding the backend.
   let hostTheme: HostTheme = loadHostTheme() ?? DEFAULT_HOST_THEME
   const tmuxBackend = terminalConfig.backends.includes('tmux') && !tmuxUnavailable ? new TmuxBackend(() => hostTheme) : null
-  const herdrTargets = await resolveHerdrTargets()
-  activeHerdrSessions = herdrTargets.map((target) => target.sessionName)
-  const resolvedHerdrPaths = herdrTargets.flatMap((target) => target.state === 'available' ? [target.endpoint.socketPath] : [])
-  // Only an operator-named pair of aliases is a configuration error worth refusing to start over.
-  // Discovery cannot produce one — resolveConfiguredHerdrSessions already downgrades aliased sessions to
-  // unavailable — and a machine that never asked for Herdr must not fail to start because of it.
-  if (herdrSessionsExplicit && new Set(resolvedHerdrPaths).size !== resolvedHerdrPaths.length) {
-    throw new Error('two configured Herdr session names resolve to the same canonical endpoint')
-  }
-  const herdrStartup = await Promise.all(herdrTargets.map(async (target) => {
-    if (target.state === 'unavailable') return { sessionName: target.sessionName, state: 'unavailable' as const, reason: target.reason }
-    const backend = new HerdrBackend(target.endpoint)
-    const ping = await backend.client.ping()
-    if (ping.ok) return { sessionName: target.sessionName, state: 'available' as const, backend }
-    return {
-      sessionName: target.sessionName,
-      state: ping.code === 'protocol_mismatch' ? 'incompatible' as const : 'unavailable' as const,
-      reason: ping.reason,
-    }
-  }))
-  const herdrBackends = herdrStartup.flatMap((target) => target.state === 'available' ? [target.backend] : [])
-  const herdrTargetStates = new Map(herdrStartup.map((target) => [target.sessionName, {
-    state: target.state,
-    ...(target.state === 'available' ? {} : { reason: target.reason }),
-  }]))
-  // Fatal only when the operator asked for these backends. Auto-detection must never let a Herdr this
-  // build does not speak (a newer protocol, say) take down a daemon whose user never mentioned Herdr.
-  if (backendsExplicit && !tmuxBackend && herdrStartup.length > 0
-    && herdrStartup.every((target) => target.state === 'incompatible')) {
-    throw new Error('every enabled terminal backend is protocol-incompatible')
-  }
-  const terminalBackends = [...(tmuxBackend ? [tmuxBackend] : []), ...herdrBackends]
+  const terminalBackends = tmuxBackend ? [tmuxBackend] : []
   const terminals = new TerminalBackendCoordinator(
     terminalBackends,
     terminalConfig.backends,
-    activeHerdrSessions,
   )
-  const refreshHerdrTargets = async (): Promise<void> => {
-    if (!terminalConfig.backends.includes('herdr')) return
-    const resolved = await resolveHerdrTargets()
-    // A session started after the daemon shows up here, on the next pass — which is the whole point:
-    // discovery, not configuration, decides what is watched.
-    activeHerdrSessions = resolved.map((target) => target.sessionName)
-    const available = resolved.filter((target): target is Extract<typeof target, { state: 'available' }> => target.state === 'available')
-    const aliased = new Set<string>()
-    const byPath = new Map<string, string>()
-    for (const target of available) {
-      const owner = byPath.get(target.endpoint.socketPath)
-      if (owner) { aliased.add(owner); aliased.add(target.sessionName) }
-      else byPath.set(target.endpoint.socketPath, target.sessionName)
-    }
-
-    const recovered = new Map(herdrBackends.map((backend) => [backend.endpoint.sessionName, backend]))
-    for (const target of resolved) {
-      if (target.state === 'unavailable') {
-        herdrTargetStates.set(target.sessionName, { state: 'unavailable', reason: target.reason })
-        continue
-      }
-      if (aliased.has(target.sessionName)) {
-        recovered.delete(target.sessionName)
-        herdrTargetStates.set(target.sessionName, { state: 'incompatible', reason: 'configured Herdr sessions alias one endpoint' })
-        continue
-      }
-      const backend = new HerdrBackend(target.endpoint)
-      const ping = await backend.client.ping()
-      if (!ping.ok) {
-        if (ping.code === 'protocol_mismatch') recovered.delete(target.sessionName)
-        herdrTargetStates.set(target.sessionName, {
-          state: ping.code === 'protocol_mismatch' ? 'incompatible' : 'unavailable',
-          reason: ping.reason,
-        })
-        continue
-      }
-      recovered.set(target.sessionName, backend)
-      herdrTargetStates.set(target.sessionName, { state: 'available' })
-    }
-    herdrBackends.splice(0, herdrBackends.length, ...activeHerdrSessions.flatMap((name) => {
-      const backend = recovered.get(name)
-      return backend ? [backend] : []
-    }))
-    terminalBackends.splice(0, terminalBackends.length, ...(tmuxBackend ? [tmuxBackend] : []), ...herdrBackends)
-    terminals.replaceBackends(terminalBackends)
-    terminals.setHerdrSessionOrder(activeHerdrSessions)
-    if (herdrBackends.length === activeHerdrSessions.length) {
-      writeTerminalConfigSnapshot(env.ADAPTER_DATA_DIR, terminalConfig, herdrBackends.map((backend) => backend.endpoint))
-    }
-  }
-  const completeHerdrSnapshot = !terminalConfig.backends.includes('herdr')
-    || herdrBackends.length === activeHerdrSessions.length
-  if (completeHerdrSnapshot) {
-    writeTerminalConfigSnapshot(
-      env.ADAPTER_DATA_DIR,
-      terminalConfig,
-      herdrBackends.map((backend) => backend.endpoint),
-    )
-  } else {
-    const previous = readTerminalConfigSnapshot(env.ADAPTER_DATA_DIR)
-    const previousNames = previous?.herdrEndpoints.map((endpoint) => endpoint.sessionName) ?? []
-    if (JSON.stringify(previousNames) !== JSON.stringify(activeHerdrSessions)
-      || !previous?.backends.includes('herdr')) {
-      // The configured allowlist changed but cannot be resolved completely. Publish a fail-closed
-      // snapshot rather than leaving an old endpoint authorized for daemon-down hooks.
-      writeTerminalConfigSnapshot(env.ADAPTER_DATA_DIR, {
-        backends: terminalConfig.backends.filter((backend) => backend !== 'herdr'),
-        herdrSessions: [],
-      }, [])
-    }
-  }
   console.log(`[terminal] enabled backends: ${terminalConfig.backends.join(', ')}`)
   if (tmuxBackend) {
     // Before the first inventory: sessions a pre-prefix build named `<engine>-<ts>` are renamed to
@@ -1648,11 +1546,6 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         ? `[env] read ${count} variables from the login shell in ${Date.now() - t0}ms (engine one-shots only)`
         : '[env] could not read a login shell environment — engine one-shots use the daemon environment only')
     })
-  }
-  for (const target of herdrStartup) {
-    console.log(target.state === 'available'
-      ? `[terminal] Herdr session ${target.sessionName}: available`
-      : `[terminal] Herdr session ${target.sessionName}: ${target.state} (${target.reason})`)
   }
 
   const terminalSession = (target: string): RegisteredSession | undefined => registry.resolve(target)
@@ -1855,6 +1748,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     onUrl: (agentId, url) => {
       dshFrameFor(agentId).viewerUrl = url
       backendRef?.viewerForwarder.refresh(agentId)
+      backendRef?.interactiveViewers.refresh(agentId)
       syncCompanion(agentId)
     },
     log: (line) => console.log(line),
@@ -1933,6 +1827,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   let autonomousDeviceDirect: AutonomousDeviceDirect | undefined
   let deviceStoreRef: ReturnType<typeof createDeviceStore> | undefined
   let autonomousDeviceService: AutonomousDeviceService | undefined
+  let appFormWindow: { machineId: string; connId: string } | undefined
   let appVoiceFocus: { machineId: string; agentId: string; connId: string } | undefined
   let backendRef: BackendSocket | undefined
   let fullReconcile: (announceDevice?: boolean) => Promise<void> = async () => {}
@@ -1945,6 +1840,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   // not. Both are just "the id this daemon serves under" to everything downstream — the local
   // websocket binds clients to it, the app selects by it — and the backend binds a machine to the
   // computer id at login, so a sign-in ADOPTS this machine rather than minting a second one.
+  // The trust group (lib/e2ee/groupSyncer.ts). Built once the relay pool exists, far below; the hook
+  // handlers and the backend callbacks declared before then reach it through this.
+  let groupSyncer: GroupSyncer | null = null
   const backend = new BackendSocket(session?.machineId ?? computerId(), auth, (connected) => {
     if (!connected) return
     const sessions = registry.advertised()
@@ -2129,7 +2027,8 @@ async function runForeground(session: AuthSession | null): Promise<void> {
    */
   const neverFoldedHistory = new Set<string>()
   /**
-   * Sessions whose first turn has already been replayed live by an attach.
+   * Sessions whose first turn has already been replayed live by an attach, or whose transcript an attach
+   * has already folded.
    *
    * NOT the same question as `neverFoldedHistory` above, which is why they stay two sets: that one asks
    * "where should the watcher start reading?", this one asks "has this session's file already been
@@ -2200,7 +2099,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
       payload: { kind: 'error', text: deviceErrorText(deviceMessage, engine) },
     })
   }
-  const cursorDiscovery = new CursorTranscriptDiscovery(env.CURSOR_HOME, (sessionId, transcriptPath) => {
+  const cursorDiscovery = new CursorTranscriptDiscovery(cursorDataDir(), (sessionId, transcriptPath) => {
     const existing = registry.bySession(sessionId)
     if (!existing || existing.engine !== 'cursor' || existing.transcriptPath === transcriptPath) return
     const result = registry.register({
@@ -2453,7 +2352,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // `reset` attach (claude fires `SessionStart` on compact, which resets) would fold the by-then
     // complete transcript and emit it live on top of everything the watcher had already streamed. That
     // is the same duplicate-turn class this whole change exists to remove.
-    if (replayLive) replayedFirstTurn.add(session.sessionId)
+    // Any fold of a transcript with content counts too: the watcher now tails it from the end, so a later
+    // replay could only send history out again as if it were live.
+    if (replayLive || lines.length) replayedFirstTurn.add(session.sessionId)
     if (initialEvents.length) {
       emitSessionEvents(session.sessionId, initialEvents)
       console.log(`[agent] ${sid(session.agentId)} replayed the first turn its transcript already held · ${initialEvents.length} events`)
@@ -2632,8 +2533,12 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // that gap is exactly where the stale recap used to flash back.
     const target = payload.sessionId || payload.agentId
     if (typeof target === 'string' && target) showAwaitingAnswer(target)
-    void questions.answer(payload)
+    // Returned so the client that answered hears a refusal — STALE_QUESTION when the dialog changed
+    // before its answer arrived — as `question_response_result`.
+    return questions.answer(payload)
   }
+  // What is still being asked, by session — handed to a window that connects later (openQuestions below).
+  const openQuestions = new Map<string, Record<string, unknown>>()
   const questionWatcher = new QuestionWatcher({
     getSession: (id) => registry.resolve(id),
     capture: captureTerminal,
@@ -2662,6 +2567,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
       // today: a remote machine's watcher is gated on ITS OWN audience, which a window attached over
       // here is not part of either way.
       backend.sendLocal(asked)
+      openQuestions.set(sessionId, asked)
       console.log(`[question] ${sid(sessionId)} asking the user · "${preview(shaped[0]?.q ?? '')}" · req=${requestId}`)
     },
     // Answered somewhere else — the app, or the pane by hand. Every client drawing it is told to stop
@@ -2680,6 +2586,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
       // one already answered. This is the mechanism behind "answer anywhere": the dial is cabled to
       // this very computer, so the dial and this window are always the same machine's audience.
       backend.sendLocal(closed)
+      openQuestions.delete(sessionId)
       console.log(`[question] ${sid(sessionId)} answered elsewhere · closing on every client · req=${requestId}`)
     },
   })
@@ -2778,6 +2685,81 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   // and the voice router know. Resolve across the two, or every tile restores empty.
   backend.recentProvider = (id, n) => mirror.recent(registry.resolve(id)?.sessionId || stoppedAgents.get(id)?.sessionId || id, n)
   backend.recentAsksProvider = (id, n) => mirror.recentAsks(registry.resolve(id)?.sessionId || stoppedAgents.get(id)?.sessionId || id, n)
+
+  // The engines that keep a conversation in a database instead of a transcript file, read through
+  // the same readers and replay normalizers as `session_get`.
+  const databaseHistory = (s: RegisteredSession): (() => Promise<readonly LiveEvent[]>) | undefined => {
+    switch (s.engine) {
+      case 'opencode': return async () => opencodeMessagesToEvents(await readOpencodeMessages(join(env.OPENCODE_DATA_DIR, 'opencode.db'), s.sessionId))
+      case 'kilo': return async () => kiloMessagesToEvents(await readKiloMessages(join(env.KILO_DATA_DIR, 'kilo.db'), s.sessionId))
+      case 'devin': return async () => devinMessagesToEvents(await readDevinMessages(join(env.DEVIN_HOME, 'sessions.db'), s.sessionId))
+      case 'hermes': return async () => hermesMessagesToEvents(await readHermesMessages(await hermesDbForSession(s), s.sessionId))
+      default: return undefined
+    }
+  }
+
+  // Session search: every turn of every conversation on this machine, live and stopped, indexed from
+  // its transcript and searched by `session_search` (lib/sessionSearch/). Nothing leaves the machine
+  // but the hits for a query. A Node without `node:sqlite` has no index; the RPC then says so.
+  // Conversations on this machine that Harness did not start, found where each engine keeps them so
+  // Cmd-P can find them and open one here; and which sessions a process has open right now. Harness's
+  // own byproducts (recaps run in its data folder) are never among them.
+  const externalEngines = externalProviders()
+  const externalSessions = new ExternalSessions({ providers: externalEngines, excluded: [env.ADAPTER_DATA_DIR], log: (line) => console.warn(line) })
+  const openSessions = new OpenSessions({ providers: externalEngines, log: (line) => console.warn(line) })
+  const sessionSearch = (() => {
+    try {
+      const store = SessionSearchStore.open(join(env.ADAPTER_DATA_DIR, SESSION_SEARCH_FILE))
+      if (!store) {
+        console.warn('[search] node:sqlite is not available on this Node — session search is off')
+        return null
+      }
+      const index = new SessionSearchIndex({
+        store,
+        sources: () => {
+          const own = [...registry.list(), ...stoppedAgents.list()]
+          const sources = own.flatMap((s): SearchSource[] => {
+            const readHistory = s.transcriptPath ? undefined : databaseHistory(s)
+            if (!s.sessionId || (!s.transcriptPath && !readHistory)) return []
+            return [{
+              agentId: s.agentId,
+              sessionId: s.sessionId,
+              engine: s.engine,
+              transcriptPath: s.transcriptPath || null,
+              header: [projectDisplayName(s), s.title, folderWords(s.cwd)].filter(Boolean).join(' · '),
+              // Conversation stamps only: the row's `touchedAt` moves on every discovery pass.
+              changedAt: Math.max(s.lastTranscriptAt || 0, s.lastHookAt || 0) || s.boundAt || s.registeredAt || 0,
+              readHistory,
+            }]
+          })
+          // Conversations Harness did not start — any Harness agent's, earlier ones included, are not.
+          const known = store.ownedSessionIds()
+          for (const s of own) if (s.sessionId) known.add(s.sessionId)
+          for (const e of externalSessions.list()) {
+            // A conversation Harness holds under any of its ids is Harness's.
+            if (known.has(e.sessionId) || e.aliases?.some((id) => known.has(id)) || (!e.transcriptPath && !e.readHistory)) continue
+            sources.push({
+              agentId: '', sessionId: e.sessionId, engine: e.engine, transcriptPath: e.transcriptPath,
+              header: '', changedAt: e.mtime, external: { cwd: e.cwd, origin: e.origin, title: e.title },
+              ...(e.readHistory ? { readHistory: e.readHistory } : {}),
+            })
+          }
+          return sources
+        },
+        agents: () => [...registry.list(), ...stoppedAgents.list()].map((s) => s.agentId),
+        discover: () => externalSessions.scan(),
+        openSessions,
+        log: (line) => console.log(line),
+      })
+      index.start()
+      return index
+    } catch (error) {
+      console.error('[search] could not open the session index:', error instanceof Error ? error.message : error)
+      return null
+    }
+  })()
+  backend.sessionSearchProvider = sessionSearch ? (query, options) => sessionSearch.search(query, options) : null
+  backend.sessionTailProvider = sessionSearch ? (sessionId, options) => sessionSearch.tail(sessionId, options) : null
 
   const runtimeController = new RuntimeProfileController({
     manager: runtimeProfiles,
@@ -2894,6 +2876,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         if (isSubagentSession(sessionId)) frame.subagent = true
       }
       backend.send(frame)
+      if (event.type === 'turn_started' || event.type === 'turn_ended') sessionSearch?.touch(sessionId)
       if (event.type === 'turn_started') {
         turnStartedAt.set(sessionId, Date.now())
         console.log(`[turn] ${sid(sessionId)} started · engine=${registry.bySession(sessionId)?.engine ?? 'claude'} · bytes=${Buffer.byteLength(event.payload.userMessage, 'utf8')}`)
@@ -2936,7 +2919,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     if (!opts?.replay) autonomousDeviceService?.stream(agentIdFor(sessionId), events)
   }
   for (const queued of queuedSessionEvents.splice(0)) emitSessionEvents(queued.sessionId, queued.events, queued.opts)
-  const cursorSubagents = new CursorSubagentManager(env.CURSOR_HOME, emitSessionEvents)
+  const cursorSubagents = new CursorSubagentManager(cursorConfigDir(), emitSessionEvents, cursorDataDir())
   const cursorTaskHooks = new CursorTaskHookQueue({
     drainTranscript: (sessionId) => watcher.pollSession(sessionId),
     emit: emitSessionEvents,
@@ -3111,10 +3094,14 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // so the birth-vs-`registeredAt` comparison stays, and comparing against `boundAt` instead — the
     // obvious-looking alternative, since `boundAt` is when this session was bound — does not work: the
     // transcript is created a moment BEFORE the hook binds it.
-    const bornAfterAgent = !meta.rebound && entry.boundAt !== null
-      && entry.boundAt - entry.registeredAt > 0
-      && !!entry.transcriptPath
-      && await statBirthMs(entry.transcriptPath) >= entry.registeredAt
+    //
+    // And only while the file is new (`transcriptIsFirstTurn`): a long session's transcript was born after
+    // its agent too, and after a daemon restart its next SessionStart replayed the whole history live.
+    const bornAfterAgent = transcriptIsFirstTurn(
+      entry,
+      entry.transcriptPath ? await statBirthMs(entry.transcriptPath) : 0,
+      { rebound: !!meta.rebound, now: Date.now() },
+    )
     const attached = await attachSession(entry, reset, entry.engine === 'cursor', bornAfterAgent)
     if (!attached) {
       registry.unbindSession(entry.sessionId)
@@ -3216,7 +3203,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         if (Number.isFinite(ownerStarted) && (!Number.isFinite(observedStarted) || observedStarted <= ownerStarted)) return
       }
       transcriptPath = observed.engine === 'cursor'
-        ? await findCursorTranscript(env.CURSOR_HOME, sessionId) ?? undefined
+        ? await findCursorTranscript(cursorDataDir(), sessionId) ?? undefined
         : observed.engine === 'grok'
           ? await findGrokTranscript(env.GROK_HOME, observed.cwd, sessionId) ?? undefined
           : observed.engine === 'agy'
@@ -3283,8 +3270,6 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     current: () => registry.list(),
     backends: terminalBackends,
     backendOrder: terminalConfig.backends,
-    herdrSessionOrder: terminalConfig.herdrSessions,
-    beforeProbe: refreshHerdrTargets,
     transaction: (apply) => registry.transaction(apply),
     onDiscovered: async (observed) => {
       const launching = observed.runtimes
@@ -3535,6 +3520,8 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     machineId: () => backend.machineId,
     identity: sharingIdentity.getIdentity(),
     grants: new HarnessGrantStore(join(env.ADAPTER_DATA_DIR, 'harness-shares.json')),
+    collaboration: new HarnessCollaborationStore(join(env.ADAPTER_DATA_DIR, 'harness-collaboration.json')),
+    autonomousEnv: env.AUTONOMOUS_ENV,
     terminals, resolveAgent: (id) => registry.resolve(id),
     send: (id, type, payload) => backend.sendObserver(id, type, payload),
     publish: (method, path, body) => proxyBackend(method, path, body),
@@ -3626,7 +3613,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   }
 
 
-  const { server: hookServer, port: hookPort } = await startHookServer(env.PORT, {
+  const { server: hookServer, port: hookPort, localSocket } = await startHookServer(env.PORT, {
     onCommandBar: commandBarService,
     onAutonomousDeviceRequest: async (method, target, body) => {
       if (!autonomousDeviceService) return { status: 503, body: { error: { code: 'UNAVAILABLE', message: 'Autonomous device service is starting' } } }
@@ -3652,14 +3639,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
       if (!callerPid) return null
       const resolved: TerminalRuntimeRef[] = []
       for (const hint of runtimeHints ?? []) {
-        if (hint.backend === 'tmux') {
-          if (tmuxBackend) resolved.push({ backend: 'tmux', paneId: hint.paneId })
-          continue
-        }
-        const backend = herdrBackends.find((candidate) => herdrHintSelects(candidate.endpoint, hint))
-        if (!backend) continue
-        const runtime = await backend.resolveRuntimeHint(hint.paneId)
-        if (runtime.state === 'succeeded') resolved.push(runtime.value)
+        if (tmuxBackend) resolved.push({ backend: 'tmux', paneId: hint.paneId })
       }
       for (const runtime of resolved) await agentReconciler.triggerHint(runtime, engine)
 
@@ -3685,8 +3665,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
        * Caller ancestry is the strongest evidence and stays the first choice, but it assumes every engine
        * spawns its hook from inside its own process tree — and Cursor does not. Measured on both
        * backends: `agent` in a pane registers fine, then every one of its hooks is rejected because the
-       * process that POSTs is not a descendant of the pane's engine, so no session ever binds. It is not
-       * a Herdr problem; tmux fails identically.
+       * process that POSTs is not a descendant of the pane's engine, so no session ever binds.
        *
        * Keep that exception specific to Cursor. A delayed hook from an exited process can still name
        * a pane now owned by its replacement; the pane and hook credential alone cannot prove that a
@@ -3698,21 +3677,6 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         if (!candidate) continue
         if (callerBelongsTo(candidate)) candidates.set(candidate.agentId, candidate)
         else onHintedRuntime.set(candidate.agentId, candidate)
-      }
-      // A moved Herdr pane may leave an inherited stale route. Caller/process correlation is the
-      // deterministic fallback, but only within a configured Herdr session named by the hook.
-      if (!candidates.size && runtimeHints?.some((hint) => hint.backend === 'herdr')) {
-        const configuredSessions = new Set(runtimeHints
-          .filter((hint): hint is Extract<HookTerminalHint, { backend: 'herdr' }> => hint.backend === 'herdr')
-          .flatMap((hint) => herdrBackends
-            .filter((backend) => herdrHintSelects(backend.endpoint, hint))
-            .map((backend) => backend.endpoint.sessionName)))
-        for (const candidate of registry.list()) {
-          if (candidate.engine !== engine || !callerBelongsTo(candidate)) continue
-          if (candidate.runtimes.some((runtime) => runtime.backend === 'herdr' && configuredSessions.has(runtime.sessionName))) {
-            candidates.set(candidate.agentId, candidate)
-          }
-        }
       }
       const choice = chooseHookAgent([...candidates.values()], [...onHintedRuntime.values()], engine)
       if (choice.agent) {
@@ -3930,9 +3894,22 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     },
     onClearRemotePassword: () => { backend.clearRemotePassword(); return { status: 200, body: { ok: true } } },
     onRemotePasswordStatus: () => ({ status: 200, body: backend.remotePasswordStatus() }),
+    onTrustLinkedPeer: (peer) => {
+      backend.trustPeer({ ...peer, kind: 'machine' })
+      groupSyncer?.linked({ ...peer, kind: 'machine' })
+      return { status: 200, body: { ok: true } }
+    },
+    onGroupList: () => ({ status: 200, body: { self: groupSelf(), members: new TrustGroupStore().list() } }),
+    onGroupSync: () => { void groupSyncer?.syncAll(); return { status: 200, body: { ok: true } } },
+    onGroupRemove: (selector) => {
+      const found = findGroupMember(selector)
+      if (!found.ok) return { status: found.error === 'AMBIGUOUS' ? 409 : 404, body: { error: found.error } }
+      groupSyncer?.remove(found.pub)
+      return { status: 200, body: { label: found.label, fingerprint: found.fingerprint } }
+    },
     // Local dashboard (GET /api/status): adapter health + computer fingerprint + local pairings. It
     // deliberately does NOT expose chat/transcripts — those live in the cloud web (WEB_URL/commander).
-    onStatus: () => ({
+    onStatus: async () => ({
       machineId: backend.machineId,
       computerId: computerId(),
       // Whether this daemon booted with an account. Read LIVE, not from the boot session: a login or
@@ -3946,6 +3923,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         terminalProtocolVersion: TERMINAL_BINARY_VERSION,
         e2ee: false,
       },
+      // The same REST and local WS, over the daemon's Unix socket (lib/localSocket.ts). Null where
+      // none could be opened; clients then stay on this port.
+      localSocket: daemonBoot.localSocket?.path ?? null,
       backendUrl: env.BACKEND_WS_URL,
       webUrl: env.WEB_URL,
       connected: backend.isConnected(),
@@ -3970,24 +3950,15 @@ async function runForeground(session: AuthSession | null): Promise<void> {
       config: {
         watching: `${terminalConfig.backends.join(' + ')} terminals across all supported engines`,
         terminalBackends: terminalConfig.backends,
-        // What is watched NOW, not what was configured at boot: under auto-detection the session set is
-        // discovered per pass, so reporting the (empty) configured list would answer the wrong question
-        // for the one person most likely to ask it — someone checking why their pane is not showing up.
-        herdrSessions: activeHerdrSessions,
         terminalSelection: backendsExplicit ? 'configured' : 'auto',
         terminalTargets: [
           ...(tmuxBackend ? [{ backend: 'tmux', instance: 'default', state: 'configured' }] : []),
-          ...activeHerdrSessions.map((sessionName) => ({
-            backend: 'herdr',
-            sessionName,
-            ...(herdrTargetStates.get(sessionName) ?? { state: 'unavailable', reason: 'not yet resolved' }),
-          })),
         ],
         dormantAgents: registry.list().filter((session) => !session.active).length,
         dataDir: tildify(env.ADAPTER_DATA_DIR),
         port: daemonPort(),
       },
-      sessions: registry.advertised().map((s) => ({
+      sessions: await Promise.all(registry.advertised().map(async (s) => ({
         id: s.agentId,
         sessionId: s.sessionId,
         name: projectDisplayName(s),
@@ -3995,8 +3966,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         cwd: tildify(s.cwd ?? ''),
         tmuxPane: s.tmuxPane || null,
         terminal: { available: registry.terminalAvailable(s.agentId), primary: s.primaryRuntimeKey, runtimes: s.runtimes },
-        updatedAt: s.updatedAt,
-      })),
+        // When the conversation last moved, as in every agent frame — not the row's `touchedAt`.
+        updatedAt: await lastActivityAt(s),
+      }))),
       pairs: backend.listPairs(),
       pending: backend.pendingPair(),
     }),
@@ -4008,6 +3980,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     onMachineRename: (machineId, name) => proxyBackend('PATCH', `/api/machines/${encodeURIComponent(machineId)}`, { name }),
     onMachineDelete: (machineId) => proxyBackend('DELETE', `/api/machines/${encodeURIComponent(machineId)}`),
     onAuthMe: () => proxyBackend('GET', '/api/auth/me'),
+    onAuthHandoff: () => proxyBackend('POST', '/api/auth/handoff', {}),
     // Signed out there is nothing shared WITH this computer and nobody to ask: a share is made on the
     // account. Answered as an empty list rather than proxied into the backend's 401, which is the one
     // status the desktop app reads as "your session ended" — and a guest has no session to end.
@@ -4019,7 +3992,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     onDeskRead: () => proxyBackend('GET', '/api/desk'),
     onDeskOps: (body) => proxyBackend('POST', '/api/desk/ops', body),
     onStore: (method, path, body) => proxyBackend(method, path, body),
-  })
+  }, { socketPath: localSocketPath(env.ADAPTER_DATA_DIR, env.PORT) })
   // Claim the pid file for OURSELVES, and only now that the control port is bound. It used to be
   // written by whoever spawned us — so a parent that died mid-handover left a daemon nothing could
   // manage — and then, for a while, by us at the top of this function, before the bind — so a child
@@ -4030,6 +4003,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   // The one thing a handoff that happens before start-up finishes has to release: the port has no
   // fallback, so a successor that cannot bind it is a daemon that does not come up (see bootHandoff).
   daemonBoot.hookServer = hookServer
+  daemonBoot.localSocket = localSocket
   console.log(`[cli] daemon pid ${process.pid} · v${VERSION}${process.env.ADAPTER_UPDATED_TO ? ' · updated' : ''} · listening on 127.0.0.1:${hookPort}`)
   // Same on-disk identity `harness remote-password set`/`link connect` use (E2eeStore.init() is
   // idempotent per file, so a separate in-memory instance here just reads the one this machine
@@ -4041,7 +4015,30 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     env.BACKEND_WS_URL.replace(/\/$/, ''),
     relayIdentityStore.getIdentity(),
     new MachinePeerStore(),
+    { onSessionReady: (machineId) => groupSyncer?.sessionOpened(machineId) },
   )
+  // Every machine and phone linked to this one, directly or through another member, trusts every other:
+  // rosters are swapped over any session that opens, and pushed on whenever they change.
+  groupSyncer = new GroupSyncer({
+    store: new TrustGroupStore(),
+    peers: new MachinePeerStore(),
+    self: groupSelf,
+    trust: (peer) => backend.trustPeer(peer),
+    untrust: (pub) => { backend.untrustPeer(pub) },
+    paired: () => backend.pairedPeers(),
+    request: relayRequester(relayPool, () => readAuthSession()?.autonomousEnv ?? env.AUTONOMOUS_ENV),
+    dropSessions: (machineId) => { relayPool.invalidate(machineId); relayPool.invalidateIsolated(machineId) },
+    reachable: () => {
+      // Only a list the backend answered says who is offline; otherwise try every member.
+      const { machines, source } = machineListCache.list()
+      return source !== 'backend' ? null : new Set(machines.filter((m) => m.state !== 'offline').map((m) => m.machineId))
+    },
+    log: (line) => console.log(line),
+  })
+  backend.groupSync = groupSyncer
+  backend.onPeerLinked = (peer) => groupSyncer?.linked(peer)
+  backend.onUnpaired = (pub) => groupSyncer?.unpaired(pub)
+  if (session?.machineId) groupSyncer.start()
   // Spoken tasks go to the WINDOW to be routed, not to the copy of the router in this process.
   //
   // Built here because both ends need it: the local socket hands it the window's replies, and the cable
@@ -4058,17 +4055,43 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     log: (line) => console.log(`[cable] ${line}`),
   })
 
+  const windowSelection: WindowSelection = new WindowSelection({
+    focus: () => appVoiceFocus,
+    send: (connId, payload) => localWsServer.sendToWindow(connId, { type: 'dial_selection', payload }),
+  })
+  const windowForm = new WindowForm({
+    focus: () => appFormWindow,
+    send: (connId, payload) => localWsServer.sendToWindow(connId, { type: 'dial_form', payload }),
+    log: (line) => console.log(`[cable] ${line}`),
+  })
+  const windowVisit = new WindowVisit({
+    focus: () => appVoiceFocus,
+    send: (connId, payload) => localWsServer.sendToWindow(connId, { type: 'dial_visit', payload }),
+  })
   const localWsServer = attachLocalWsServer(hookServer, {
+    localSocketServer: localSocket?.server ?? null,
     shareRelay,
+    onSelectionReply: (connId, machineId, payload) => windowSelection.reply(connId, machineId, payload),
+    onVisitReply: (connId, machineId, payload) => windowVisit.reply(connId, machineId, payload),
+    onFormReply: (connId, machineId, payload) => windowForm.reply(connId, machineId, payload),
+    onAppDisconnect: (machineId, connId) => {
+      if (appFormWindow?.connId === connId) appFormWindow = undefined
+      if (appVoiceFocus?.connId === connId) appVoiceFocus = undefined
+      windowForm.disconnected(connId)
+      windowSelection.focusChanged()
+      autonomousDeviceService?.appFocus(machineId, null, connId)
+    },
     // The window and the dial are one desk: opening an agent in the app brings the dial to it, switching
     // the dial's machine first when the app moved to another one.
     onDevicePrepareOpened: (operationId, agentId) => deviceStoreRef?.acknowledgeReveal(operationId, agentId),
     onAppFocusState: (machineId, agentId, connId, expectedRevision) => {
       // A delayed automatic selection cannot replace a newer explicit user choice.
       if (expectedRevision && autonomousDeviceService?.focusSnapshot().focusRevision !== expectedRevision) return false
+      appFormWindow = { machineId, connId }
       if (agentId === null) {
         if (appVoiceFocus?.connId === connId) appVoiceFocus = undefined
       } else appVoiceFocus = { machineId, agentId, connId }
+      windowSelection.focusChanged()
       autonomousDeviceService?.appFocus(machineId, agentId, connId)
     },
     onAppFocus: (machineId, agentId) => { void cableRef?.followApp(machineId, agentId) },
@@ -4146,7 +4169,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // first fifteen they can SEE. An earlier cut put open tiles first, on the theory that working on
     // something is a statement about relevance; it is, but it also made the fifteen unpredictable from
     // the screen, and predictable beat clever here (owner's call).
-    onRouteTask: async (text) => {
+    onRouteTask: backend.ownerCommands.onRouteTask = async (text) => {
       const host = cableHostRef
       if (!host) return { agentId: '', machineId: '', name: '', confidence: 0, reason: 'no agent list yet', candidates: [], weighed: 0, machines: 0, via: '' }
       // Whatever the daemon knows right now. This also kicks a refresh of the remote machines, so a list
@@ -4264,7 +4287,8 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // one the dial has been using for every voice turn.
     // A window that connects after the dial did has missed the `dial_status` that announced it.
     dialStatus: () => cableHostRef?.currentDialStatus() ?? { attached: false },
-    onRouteSend: (agentId, text) => {
+    openQuestions: () => [...openQuestions.values()],
+    onRouteSend: backend.ownerCommands.onRouteSend = (agentId, text) => {
       const sent = cableHostRef?.sendTurn(agentId, text) ?? { ok: false as const, machine: '', reason: 'no agent list yet' }
       console.log(`[route] ⌘K → ${sid(agentId)} · bytes=${Buffer.byteLength(text, 'utf8')}`
         + (sent.ok ? '' : ` · REFUSED: ${sent.reason}${sent.machine ? ` (${sent.machine})` : ''}`))
@@ -4793,8 +4817,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
    * Watch a pane this daemon just opened until its engine process shows up (ready), dies (failed), or
    * ten minutes pass. Shared by create and fork: the two open panes the same way and wait the same way.
    */
-  const watchNewPane = async (engine: AgentEngine, pending: RegisteredSession, spawned: { runtime: TmuxRuntimeRef }, command: string[], installIfMissing: ReturnType<typeof engineInstallRecipe> | undefined): Promise<void> => {
-    const budgetMs = 10 * 60_000
+  const watchNewPane = async (engine: AgentEngine, pending: RegisteredSession, spawned: { runtime: TmuxRuntimeRef }, command: string[], installIfMissing: ReturnType<typeof engineInstallRecipe> | undefined, budgetMs = 10 * 60_000): Promise<void> => {
     const startedAt = Date.now()
     let delayMs = 50
     try {
@@ -4872,7 +4895,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
         })
         delayMs = Math.min(delayMs * 2, 750)
       }
-      const detail = `${engine} did not expose an engine process within 10 minutes. The terminal remains available.`
+      const detail = `${engine} did not expose an engine process within ${Math.round(budgetMs / 60_000)} minutes. The terminal remains available.`
       const failed = registry.setLaunch(pending.agentId, { state: 'failed', error: 'START_TIMEOUT', detail })
       if (failed) announceSession(failed)
       console.warn(`[agent] create timed out · ${engine} · agent ${pending.agentId}`)
@@ -4881,8 +4904,106 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     }
   }
 
-  backend.onCreateAgent = async ({ engine, cwd, bypassPermission, permissionMode, grid, codexHome, dsh, prompt, name, agent }) => {
+  /**
+   * Whether a conversation Harness did not start can be opened here as a harness: one discovery found
+   * (looked for again if it is new), on this engine, not already a harness, and not open in a running
+   * process — a terminal or the engine's app that still has it would write it too.
+   *
+   * One open in a terminal can be taken over ([takeOver]): the terminal's process is stopped and the
+   * conversation resumes here. Asked without it, the refusal says whether that process is mid-turn,
+   * so the person can choose to wait for the turn to end or stop it now. An app's is never stopped.
+   */
+  const adoptableSession = async (sessionId: string, engine: AgentEngine, takeOver: 'idle' | 'now' | 'wait' | null): Promise<{ ok: true; cwd: string; title: string; owner: SessionOwner | null; busy: boolean; launchArgs: readonly string[] } | { ok: false; error: string; detail: string }> => {
+    const held = (id: string) => !!registry.bySession(id) || stoppedAgents.list().some((s) => s.sessionId === id)
+    if (held(sessionId)) {
+      return { ok: false, error: 'SESSION_IN_HARNESS', detail: 'This conversation is already a harness here.' }
+    }
+    const found = externalSessions.get(sessionId) ?? (await externalSessions.scan(), externalSessions.get(sessionId))
+    if (found && [found.sessionId, ...found.aliases ?? []].some(held)) {
+      return { ok: false, error: 'SESSION_IN_HARNESS', detail: 'This conversation is already a harness here.' }
+    }
+    if (!found) return { ok: false, error: 'SESSION_NOT_FOUND', detail: 'This conversation is no longer on this machine.' }
+    if (found.engine !== engine) return { ok: false, error: 'INVALID_ENGINE', detail: `This is a ${found.engine} conversation.` }
+    // The Codex app keeps a thread in a folder of its own, which people tidy away. Checked before
+    // anything is stopped: a take-over that then cannot open would only have closed it.
+    if (!existsSync(found.cwd)) {
+      return { ok: false, error: 'SESSION_FOLDER_GONE', detail: `The folder it ran in is gone: ${found.cwd}` }
+    }
+    const title = found.title || sessionSearch?.session(sessionId)?.title || ''
+    const launchArgs = found.launchArgs ?? []
+    const owner = await openSessions.owner(sessionId)
+    if (!owner) return { ok: true, cwd: found.cwd, title, owner: null, busy: false, launchArgs }
+    const engineName = engineLabel(engine)
+    // A process in one of Harness's own panes is an agent the daemon is still binding: never stopped.
+    if (owner.harness) return { ok: false, error: 'SESSION_IN_HARNESS', detail: 'This conversation is already a harness here.' }
+    // Started on it, as its arguments say, and perhaps moved on since — or in a pane nobody could check
+    // was not Harness's own: not opened twice, never stopped.
+    if (owner.fromArgs || owner.unverified) {
+      return { ok: false, error: 'SESSION_OPEN_ELSEWHERE', detail: `It may be open in ${engineName} in a terminal. Close it there, then open it here.` }
+    }
+    if (!owner.tty) {
+      return { ok: false, error: 'SESSION_OPEN_ELSEWHERE', detail: `It is open in ${engineName}'s app or an editor. Close it there, then open it here.` }
+    }
+    const busy = await openSessions.busy(owner)
+    if (busy && (takeOver === null || takeOver === 'idle')) {
+      return { ok: false, error: 'SESSION_BUSY_IN_TERMINAL', detail: `${engineName} is working on it in a terminal.` }
+    }
+    if (takeOver === null) {
+      return { ok: false, error: 'SESSION_OPEN_IN_TERMINAL', detail: `It is open in ${engineName} in a terminal. Moving it here quits it there.` }
+    }
+    return { ok: true, cwd: found.cwd, title, owner, busy, launchArgs }
+  }
+
+  /**
+   * A conversation taken over when its turn ends (`takeOver: 'wait'`): its pane waits for the
+   * terminal's process to go (engineLaunch `waitForPid`), and this stops that process once the turn
+   * is over. It gives up when the harness does — closed, or Ctrl-C in its pane — and when the person
+   * quits it in the terminal themselves, which is the pane's cue as well.
+   */
+  const takeOverWhenIdle = async (agentId: string, owner: SessionOwner, sessionId: string): Promise<void> => {
+    for (;;) {
+      await new Promise<void>((resolve) => { const timer = setTimeout(resolve, 1_000); timer.unref?.() })
+      if (registry.byAgent(agentId)?.launch?.state !== 'starting' || !processAlive(owner.pid)) return
+      // Moved on in that terminal (`/resume`, `/new`): its turn is another conversation's now, and it
+      // is left alone. The pane still waits for it to quit, and then opens this one.
+      if (await heldBy(sessionId, owner) !== 'same') {
+        console.log(`[agent] take over ${sid(sessionId)} · pid ${owner.pid} moved on · left running`)
+        return
+      }
+      if (await openSessions.busy(owner)) continue
+      const stopped = await stopSessionOwner(owner)
+      console.log(`[agent] take over ${sid(sessionId)} · turn ended · pid ${owner.pid} ${stopped ? 'stopped' : 'did not stop'}`)
+      return
+    }
+  }
+
+  /**
+   * Who holds [sessionId] now, against the [owner] seen when the person chose: `same` (that process,
+   * still a terminal's, by hard evidence, not one of Harness's own), `free` (nobody), or `other`.
+   * Asked again right before anything is stopped: the terminal may have moved to other work since.
+   */
+  const heldBy = async (sessionId: string, owner: SessionOwner): Promise<'same' | 'free' | 'other'> => {
+    const now = await openSessions.owner(sessionId)
+    if (!now) return 'free'
+    return now.pid === owner.pid && !!now.tty && !now.fromArgs && !now.harness && !now.unverified ? 'same' : 'other'
+  }
+
+  backend.onCreateAgent = async ({ engine, cwd, bypassPermission, permissionMode, grid, codexHome, dsh, prompt, name, agent, resumeSessionId, takeOver }) => {
     if (!tmuxBackend) return { ok: false, error: 'TMUX_UNAVAILABLE' }
+    // A conversation Harness did not start opens in its own folder, under its own title — taken over
+    // from the terminal that has it, when asked to.
+    let owner: SessionOwner | null = null
+    let ownerBusy = false
+    let resumeArgs: readonly string[] = []
+    if (resumeSessionId) {
+      const adopted = await adoptableSession(resumeSessionId, engine, takeOver ?? null)
+      if (!adopted.ok) return adopted
+      cwd = adopted.cwd
+      name = name ?? (adopted.title || null)
+      owner = adopted.owner
+      ownerBusy = adopted.busy
+      resumeArgs = adopted.launchArgs
+    }
     try {
       if (!statSync(cwd).isDirectory()) return { ok: false, error: 'CWD_NOT_FOUND' }
     } catch {
@@ -5021,12 +5142,29 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // The named agent takes the same argv slot on every relaunch (`buildLaunchOverrides` appends it
     // from the row's `agent`, after the grid's and the DSH's argv, exactly as here). The engine was
     // checked for a contract at the wire (AGENT_UNSUPPORTED), so this cannot throw.
-    const extraArgs = [...(gridLaunch?.args ?? []), ...dshArgs, ...(agent ? namedAgentArgs(engine, agent) : [])]
+    const extraArgs = [...(gridLaunch?.args ?? []), ...dshArgs, ...(agent ? namedAgentArgs(engine, agent) : []), ...resumeArgs]
     // The first prompt is a launch option only — never part of `extraArgs`, which the registry row
     // carries into a relaunch (engineLaunch.ts, `firstPrompt`).
-    const launchOptions = { bypassPermission, ...(permissionMode ? { permissionMode } : {}), extraArgs: extraArgs.length ? extraArgs : undefined, installIfMissing, clearEnv, cwd, harnessNode: dsh ? true : undefined, ...(prompt ? { firstPrompt: prompt } : {}), terminalHint: { machineName: terminalHintMachineName() } }
+    // Stopped mid-turn, the resumed conversation is told to carry on — by an engine that can open
+    // with a message; any other resumes where it stopped and waits.
+    const waitFor = owner && takeOver === 'wait' && ownerBusy ? owner : null
+    const firstPrompt = prompt ?? (owner && !waitFor && ownerBusy && supportsFirstPrompt(engine) ? 'continue' : null)
+    const launchOptions = { bypassPermission, ...(permissionMode ? { permissionMode } : {}), extraArgs: extraArgs.length ? extraArgs : undefined, installIfMissing, clearEnv, cwd, harnessNode: dsh ? true : undefined, ...(firstPrompt ? { firstPrompt } : {}), ...(resumeSessionId ? { resumeSessionId } : {}), ...(waitFor ? { waitForPid: { pid: waitFor.pid, name: engineLabel(engine) } } : {}), terminalHint: { machineName: terminalHintMachineName() } }
     const command = buildEngineCommandArgv(engine, launchOptions)
     const argv = buildEngineLaunchArgv(engine, launchOptions)
+    // The terminal's process goes last, once nothing here can refuse or fail the launch — the command
+    // is built — stopped now, or, to wait for its turn, left running for the pane to wait on.
+    if (owner && !waitFor && resumeSessionId) {
+      const held = await heldBy(resumeSessionId, owner)
+      if (held === 'other') {
+        return { ok: false, error: 'SESSION_OPEN_ELSEWHERE', detail: 'It moved to another process just now. Close it there, then open it here.' }
+      }
+      // Quit in its terminal meanwhile: it is free, and nothing is stopped.
+      if (held === 'same' && !await stopSessionOwner(owner)) {
+        return { ok: false, error: 'SESSION_STOP_FAILED', detail: 'The terminal that has it did not quit. Close it there, then open it here.' }
+      }
+      if (held === 'same') console.log(`[agent] take over ${sid(resumeSessionId)} · pid ${owner.pid} stopped${ownerBusy ? ' mid-turn' : ''}`)
+    }
     // A tmux route is enough to stream its screen. Register it before looking for a process so both
     // loopback and relayed Desktop clients can attach while the login shell/installer is still busy.
     // `tmuxBackend` exists whenever the CONFIG lists tmux — it is never a probe of the binary, so a
@@ -5072,7 +5210,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     announceSession(pending)
     if (pending.dsh) attachDsh(pending)
 
-    void watchNewPane(engine, pending, spawned, command, installIfMissing)
+    // A pane waiting out another terminal's turn may wait as long as that turn takes.
+    void watchNewPane(engine, pending, spawned, command, installIfMissing, waitFor ? 24 * 60 * 60_000 : undefined)
+    if (waitFor && resumeSessionId) void takeOverWhenIdle(pending.agentId, waitFor, resumeSessionId)
     console.log(`[agent] create pane open · ${engine} · agent ${pending.agentId}`)
     return { ok: true, session: pending }
   }
@@ -5297,8 +5437,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     const session = registry.resolve(agentId)
     if (!session) return { ok: false, error: 'AGENT_NOT_FOUND' }
     const pane = session.runtimes.find((runtime): runtime is TmuxRuntimeRef => runtime.backend === 'tmux')
-    // Only tmux panes can be respawned. A Herdr-hosted agent has no equivalent, and saying so is better
-    // than a generic failure the user cannot act on.
+    // Only tmux panes can be respawned. Saying so is better than a generic failure the user cannot act on.
     if (!pane) return { ok: false, error: 'RETARGET_UNSUPPORTED_BACKEND', detail: `${session.engine} is not running in a tmux pane` }
     // The swap kills a process it has validated by pid + start marker. Without one there is nothing to
     // validate, and respawning over a pane whose occupant we cannot identify is how you replace
@@ -5696,6 +5835,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     sharedViewers.stop()
     await localWsServer.close()
     hookServer.close()
+    await localSocket?.close()
     shutdownSummaryPool()
     shutdownVoiceRouter()
     // The new daemon starts its own viewers for the agents it restores; ours must not hold the ports.
@@ -5801,6 +5941,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     sharedViewers.stop()
     await localWsServer.close()
     hookServer.close()
+    await localSocket?.close()
     shutdownSummaryPool()
     shutdownVoiceRouter()
     await dshViewers.stopAll()
@@ -5897,6 +6038,12 @@ async function runForeground(session: AuthSession | null): Promise<void> {
   })
 
   const cableHost = new DaemonCableHost({
+    activityText: async (agentId) => {
+      const session = registry.resolve(agentId)
+      if (!session || (session.engine !== 'claude' && session.engine !== 'codex')) return null
+      const screen = await terminals.capture(session, { mode: 'visible', ansi: false })
+      return terminalActivity(session.engine, screen.state === 'succeeded' ? screen.value : null)
+    },
     machineName: () => { try { return readFileSync(MACHINE_NAME_FILE, 'utf8').trim() || 'This machine' } catch { return 'This machine' } },
     machineId: () => backend.machineId,
     computerId: () => computerId(),
@@ -5908,7 +6055,9 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // The dial's own object, forwarded verbatim. It used to be rebuilt here as `{ [requestId]: optionId }`
     // — keyed by the REQUEST id rather than by the question key `onQuestionAnswer` expects, so the answer
     // named a question that does not exist.
-    answer: (agentId, requestId, answers) => backend.onQuestionAnswer?.({ agentId, requestId, answers }),
+    answer: (agentId, requestId, answers) => { void backend.onQuestionAnswer?.({ agentId, requestId, answers }) },
+    answerReviewed: async answer => (await questions.answer({ agentId: answer.agentId, requestId: answer.requestId,
+      answers: answer.answers, expectedQuestions: answer.questions, selectedLabels: answer.selections, freeTextKeys: answer.freeTextKeys })).ok,
     recent: (id, n) => mirror.recent(registry.resolve(id)?.sessionId || id, n),
     recentAsks: (id) => mirror.recentAsks(registry.resolve(id)?.sessionId || id),
     runtimeProfile: (session) => runtimeProfiles.selectedModel(session),
@@ -5946,6 +6095,12 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     dialStatus: (status) => backend.sendLocal({ type: 'dial_status', payload: status }),
     // Words spoken on the overview belong to whichever agent the window's palette picks.
     routeInWindow: (text, cmd) => windowRouter.ask(text, cmd),
+    selectPassage: command => windowSelection.command(command),
+    clearSelection: () => windowSelection.cancel(),
+    visit: command => windowVisit.command(command),
+    clearVisit: () => windowVisit.cancel(),
+    form: command => windowForm.command(command),
+    clearForm: () => windowForm.clear(),
     log: (line) => console.log(`[cable] ${line}`),
   }, fleet)
   cableHostRef = cableHost
@@ -5992,7 +6147,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     },
     cancelDelivery: id => deviceInput.cancelDelivery(id),
     stop: id => cancelAgent(id, true),
-    answer: (agentId, requestId, answers) => questions.answer({ agentId, requestId, answers, allowPermissions: false }),
+    answer: async (agentId, requestId, answers) => (await questions.answer({ agentId, requestId, answers, allowPermissions: false })).ok,
     recent: (id, n) => mirror.recent(registry.byAgent(id)?.sessionId ?? id, n),
     fullText: id => mirror.lastFullText(registry.byAgent(id)?.sessionId ?? id),
     emit: (frame, deviceId) => backend.emitAutonomousDeviceEvent(frame, deviceId),
@@ -6072,6 +6227,7 @@ async function runForeground(session: AuthSession | null): Promise<void> {
     // the wheel is not pointed at still belongs to a tile the user can see — and dropping it is what a
     // tile that never leaves "Working…" looks like from the outside.
 
+    if (event.kind === 'questionClosed') { void cable.questionClose(event.agentId, event.requestId); return }
     if (event.kind === 'question') { void cable.question(event.agentId, event.requestId, event.questions); return }
     if (event.kind === 'processing') void cable.turnStarted(event.agentId, event.text)
     else if (event.kind === 'done') void cable.turnDone(event.agentId)
@@ -6310,9 +6466,17 @@ function clearAdapterState(): void {
       'summaries.json',
       'summary-scratch',
       'e2e',
+      // The session search index (lib/sessionSearch/): rebuilt from the transcripts on the next start.
+      SESSION_SEARCH_FILE,
+      `${SESSION_SEARCH_FILE}-wal`,
+      `${SESSION_SEARCH_FILE}-shm`,
     ]) {
       rmSync(join(dir, name), { recursive: true, force: true })
     }
+    // One daemon socket per control port (lib/localSocket.ts) — whichever ports have run here.
+    try {
+      for (const name of readdirSync(dir)) if (isLocalSocketName(name)) rmSync(join(dir, name), { force: true })
+    } catch { /* no such directory */ }
   }
   if (dataDir === cliDir) rmStateFiles(dataDir)
   else rmSync(dataDir, { recursive: true, force: true })
@@ -6622,6 +6786,7 @@ function humanizeLinkError(error: string, machine: string, retryAt?: number): st
     NO_REMOTE_PASSWORD: `Machine ${machine} has no remote password set. Ask its operator to run \`harness remote-password set\` there first.`,
     BAD_INTENT: 'The connection request was malformed — this usually means a version mismatch. Update harness on both machines and try again.',
     WRONG_PASSWORD: 'That password is wrong. Check it against the other machine and try again.',
+    BUSY: `Machine ${machine} is already handling another link attempt. Wait a moment and try again.`,
     TIMEOUT: `Machine ${machine} didn't respond in time. Make sure it's running \`harness start\` and reachable, then try again.`,
     SEND_FAILED: 'Could not reach the relay to start linking. Check your network connection and try again.',
     DERIVE_FAILED: 'Could not process the password locally. Try again; if it persists, restart harness and retry.',
@@ -6662,51 +6827,36 @@ async function linkConnectCommand(machineId: string | undefined, stdin: boolean,
     console.log('  this proves you know it; nothing needs approving there.\n')
     password = await promptPassword(`  Remote password for ${machineId}: `)
   }
-  const auth = new AuthSessionManager(backendHttpBase())
-  let accessToken: string
-  try {
-    accessToken = await auth.accessToken()
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err)
-    const message = `Could not refresh this computer's SSO session (${detail}). Run: harness login`
-    if (json) console.log(JSON.stringify({ ok: false, error: 'AUTH_FAILED', message }))
-    else console.error(`\n  ✗ ${message}\n`)
-    process.exit(1)
-    return
-  }
-  const store = new E2eeStore()
-  store.init()
-  const result = await connectWithPassword({
-    targetMachineId: machineId,
-    password,
-    selfIdentity: store.getIdentity(),
-    accessToken,
-    backendWsBase: env.BACKEND_WS_URL.replace(/\/$/, ''),
-    autonomousEnv: session.autonomousEnv,
-    onProgress: json ? (stage) => console.log(JSON.stringify({ stage })) : undefined,
-  })
+  const result = await linkMachineWithPassword(machineId, password, displayName, json ? (stage) => console.log(JSON.stringify({ stage })) : undefined)
   if (!result.ok) {
-    const message = humanizeLinkError(result.error, displayName || machineId, result.retryAt)
     if (json) {
-      console.log(JSON.stringify({ ok: false, error: result.error, message, ...(result.retryAt !== undefined ? { retryAt: result.retryAt } : {}) }))
+      console.log(JSON.stringify({ ok: false, error: result.error, message: result.message, ...(result.retryAt !== undefined ? { retryAt: result.retryAt } : {}) }))
     } else {
-      console.error(`\n  ✗ ${message}\n`)
+      console.error(`\n  ✗ ${result.message}\n`)
     }
     process.exit(1)
     return
   }
-  new MachinePeerStore().pin(machineId, b64e(result.peerPub), 'harness link', Date.now())
-  if (json) { console.log(JSON.stringify({ ok: true, fingerprint: result.fingerprint, machineId })); process.exit(0) }
-  console.log(`\n  ✓ Linked machine ${machineId}`)
-  console.log(`    fingerprint  ${result.fingerprint}   — verify it matches \`harness remote-password status\`'s output on the other machine\n`)
+  if (json) { console.log(JSON.stringify({ ok: true, fingerprint: result.fingerprint, machineId, mutual: result.mutual })); process.exit(0) }
+  console.log(`\n  ✓ Linked machine ${machineId}${result.mutual ? ' — both ways' : ''}`)
+  console.log(`    fingerprint  ${result.fingerprint}   — verify it matches \`harness remote-password status\`'s output on the other machine`)
+  if (!result.mutual) console.log(`    ${machineId} runs an older harness: it can't reach this machine back until it is updated and linked again.`)
+  console.log('')
   process.exit(0)
 }
 
 /**
  * The link itself, as `harness link connect` and `harness remote` both do it: this computer's SSO
  * token and identity, the remote password proved against THAT machine, and its peer pinned here.
+ * This machine says who it is inside the handshake, so a target that understands it pins it back;
+ * when it did (`mutual`), that machine is trusted here as a client too — one link, both directions.
  */
-async function linkMachineWithPassword(machineId: string, password: string, displayName?: string): Promise<{ ok: true; fingerprint: string } | { ok: false; error: string; message: string }> {
+async function linkMachineWithPassword(
+  machineId: string,
+  password: string,
+  displayName?: string,
+  onProgress?: (stage: PwConnectProgress) => void,
+): Promise<{ ok: true; fingerprint: string; mutual: boolean } | { ok: false; error: string; message: string; retryAt?: number }> {
   const session = readAuthSession()
   if (!session) return { ok: false, error: 'NOT_SIGNED_IN', message: 'Not signed in. Run: harness login' }
   const auth = new AuthSessionManager(backendHttpBase())
@@ -6726,10 +6876,55 @@ async function linkMachineWithPassword(machineId: string, password: string, disp
     accessToken,
     backendWsBase: env.BACKEND_WS_URL.replace(/\/$/, ''),
     autonomousEnv: session.autonomousEnv,
+    onProgress,
+    self: { kind: 'machine', label: hostname(), ...(session.machineId ? { machineId: session.machineId } : {}) },
   })
-  if (!result.ok) return { ok: false, error: result.error, message: humanizeLinkError(result.error, displayName || machineId, result.retryAt) }
-  new MachinePeerStore().pin(machineId, b64e(result.peerPub), 'harness link', Date.now())
-  return { ok: true, fingerprint: result.fingerprint }
+  if (!result.ok) return { ok: false, error: result.error, message: humanizeLinkError(result.error, displayName || machineId, result.retryAt), retryAt: result.retryAt }
+  const label = displayName || machineId
+  new MachinePeerStore().pin(machineId, b64e(result.peerPub), label, Date.now())
+  const mutual = result.mutual && !!session.machineId
+  if (mutual) await trustLinkedMachine({ pub: b64e(result.peerPub), machineId, kind: 'machine', label })
+  return { ok: true, fingerprint: result.fingerprint, mutual }
+}
+
+/** Trust a just-linked machine as a client of THIS one. The running daemon holds paired.json in memory
+ *  (and rewrites it whole), so the write has to go through it; with no daemon, the file is written directly. */
+async function trustLinkedMachine(peer: LinkedPeer): Promise<void> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${daemonPort()}/api/link/trust-peer`, {
+      method: 'POST',
+      headers: { 'x-adapter-local': '1', 'content-type': 'application/json' },
+      body: JSON.stringify(peer),
+    })
+    if (res.ok) return
+  } catch { /* fall back to the disk-backed store below */ }
+  const store = new E2eeStore()
+  store.init()
+  if (!store.isPaired(peer.pub)) store.addPaired(peer.pub, peer.label, Date.now(), 'web', { machineId: peer.machineId, kind: peer.kind })
+  // The daemon seeds the group from this pin and pairing when it next starts, and syncs from there.
+}
+
+/** This machine as its trust group knows it — see groupSyncer.ts's SELF_STAMP for the stamp. */
+let groupSelfPub: string | null = null
+function groupSelf(): GroupMember {
+  groupSelfPub ??= b64e(new E2eeStore().init().pub)
+  const machineId = readAuthSession()?.machineId
+  return { pub: groupSelfPub, kind: 'machine', label: hostname(), at: SELF_STAMP, ...(machineId ? { machineId } : {}) }
+}
+
+/** A trust-group member by machine id, list number, or fingerprint (full or unique prefix). */
+function findGroupMember(selector: string): { ok: true; pub: string; label: string; fingerprint: string } | { ok: false; error: 'NOT_FOUND' | 'AMBIGUOUS' } {
+  const members = new TrustGroupStore().list()
+  const norm = (v: string): string => v.toUpperCase().replace(/[·\s-]/g, '')
+  const byIndex = /^\d+$/.test(selector) ? members[Number(selector) - 1] : undefined
+  const byMachine = members.find((m) => m.machineId === selector)
+  const hit = byMachine ?? byIndex ?? (() => {
+    const matches = members.filter((m) => norm(m.fingerprint).startsWith(norm(selector)))
+    return matches.length > 1 ? 'AMBIGUOUS' as const : matches[0]
+  })()
+  if (hit === 'AMBIGUOUS') return { ok: false, error: 'AMBIGUOUS' }
+  if (!hit || !selector.trim()) return { ok: false, error: 'NOT_FOUND' }
+  return { ok: true, pub: hit.pub, label: hit.label, fingerprint: hit.fingerprint }
 }
 
 /** `harness link list` — machines this one has linked (CLI-to-CLI/machine-node trust, not browsers). */
@@ -6751,15 +6946,72 @@ async function linkListCommand(): Promise<void> {
 /** `harness link unlink <machineId>` — remove a linked machine's trust pin. */
 async function linkUnlinkCommand(machineId: string | undefined): Promise<void> {
   if (!machineId) { console.error('Usage: harness link unlink <machineId>   (see: harness link list)'); process.exit(1) }
-  const removed = new MachinePeerStore().unlink(machineId)
+  // Through the daemon: the machine leaves the trust group, so every other member drops it too.
+  const viaGroup = await daemonGroupRemove(machineId as string)
+  const removed = new MachinePeerStore().unlink(machineId as string) || viaGroup
   if (!removed) {
     console.error(`\n  ✗ No linked machine matches "${machineId}".`)
     console.error('  ▸ Run `harness link list` to see what\'s linked.\n')
     process.exit(1)
     return
   }
-  console.log(`\n  ✓ Unlinked ${machineId}\n`)
+  console.log(`\n  ✓ Unlinked ${machineId}${viaGroup ? ' — and removed from your trust group' : ''}\n`)
   process.exit(0)
+}
+
+/** Ask the running daemon to remove a trust-group member; false when there is no daemon or no match. */
+async function daemonGroupRemove(selector: string): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${daemonPort()}/api/group/remove`, {
+      method: 'POST',
+      headers: { 'x-adapter-local': '1', 'content-type': 'application/json' },
+      body: JSON.stringify({ selector }),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+/** `harness group list|sync|remove` — every machine and phone that trusts every other through links. */
+async function groupCommand(sub: string | undefined, arg: string | undefined, json: boolean): Promise<void> {
+  if (!sub || sub === 'list') {
+    const members = new TrustGroupStore().list()
+    if (json) { console.log(JSON.stringify({ members })); process.exit(0) }
+    if (!members.length) {
+      console.log('\n  No trust group yet. Link another machine (`harness link connect <machineId>`) or a phone to start one.\n')
+      process.exit(0)
+    }
+    console.log('\n  Trust group — each of these reaches every other without a password:\n')
+    members.forEach((m, i) => {
+      const id = m.kind === 'machine' ? m.machineId : 'viewer app'
+      console.log(`   ${String(i + 1).padStart(2)}. ${m.label}  ${id}  ${m.fingerprint}`)
+    })
+    console.log('')
+    process.exit(0)
+  }
+  if (sub === 'sync') {
+    try {
+      const res = await fetch(`http://127.0.0.1:${daemonPort()}/api/group/sync`, { method: 'POST', headers: { 'x-adapter-local': '1' } })
+      if (!res.ok) throw new Error(String(res.status))
+    } catch {
+      console.error('\n  ✗ Harness is not running here. Run: harness start\n')
+      process.exit(1)
+    }
+    console.log('\n  ✓ Comparing with every reachable member now.\n')
+    process.exit(0)
+  }
+  if (sub === 'remove') {
+    if (!arg) { console.error('Usage: harness group remove <machineId|#|fingerprint>   (see: harness group list)'); process.exit(1) }
+    if (!(await daemonGroupRemove(arg as string))) {
+      console.error(`\n  ✗ Could not remove "${arg}" — no member matches, or harness is not running here (harness start).\n`)
+      process.exit(1)
+    }
+    console.log(`\n  ✓ Removed ${arg} from the trust group. Every member drops it as they sync.\n`)
+    process.exit(0)
+  }
+  console.error(`Unknown command: group ${sub}`)
+  process.exit(1)
 }
 
 /** One row of `GET /api/machines`. Only the fields this CLI shows are declared. */
@@ -6955,6 +7207,9 @@ async function logsExportCommand(json: boolean): Promise<void> {
 import { orchestratorCommand } from './orchestrator/command.js'
 
 // ── arg parse ──────────────────────────────────────────────────────────────────────────────────
+// `hn` is the terminal client's short name (like tmux, fzf): the same CLI, entered at `tui`. A call
+// back into this CLI from `hn` (login, start) is marked and runs as plain `harness`.
+if (/^hn(\.js)?$/.test(process.argv[1]?.split(/[\\/]/).pop() ?? '') && process.env.HARNESS_SELF !== '1') process.argv.splice(2, 0, 'tui')
 const [, , cmd, ...rest] = process.argv
 const flags = rest.filter((a) => a.startsWith('-'))
 const args = rest.filter((a) => !a.startsWith('-'))
@@ -7142,6 +7397,9 @@ switch (cmd) {
       error: (line) => console.error(line),
     }).then((code) => { process.exitCode = code }).catch(onError)
     break
+  case 'tui':
+    tuiCommand(rest, { port: daemonPort(), signedIn: () => readAuthSession() !== null }).then((code) => { process.exitCode = code }).catch(onError)
+    break
   case 'remote':
     remoteCommand({
       tmuxPane: process.env.TMUX_PANE,
@@ -7165,6 +7423,15 @@ switch (cmd) {
       error: (line) => console.error(line),
     }).then((code) => { process.exitCode = code }).catch(onError)
     break
+  case 'search':
+    process.exitCode = searchCommand({
+      argv: rest,
+      dataDir: env.ADAPTER_DATA_DIR,
+      output: (line) => console.log(line),
+      error: (line) => console.error(line),
+      color: process.stdout.isTTY === true,
+    })
+    break
   case 'machines':
     if (!args[0]) machinesListCommand(flags.includes('--json')).catch(onError)
     else if (args[0] === 'list') machinesListCommand(flags.includes('--json')).catch(onError)
@@ -7182,6 +7449,9 @@ switch (cmd) {
     else if (args[0] === 'list') linkListCommand().catch(onError)
     else if (args[0] === 'unlink') linkUnlinkCommand(args[1]).catch(onError)
     else { console.error(`Unknown command: link ${args[0] ?? ''}`); usage(1) }
+    break
+  case 'group':
+    groupCommand(args[0], args[1], flags.includes('--json')).catch(onError)
     break
   case 'remote-password':
     if (args[0] === 'set') remotePasswordSetCommand(flags.includes('--json'), flags.includes('--stdin')).catch(onError)

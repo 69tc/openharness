@@ -41,15 +41,9 @@ describe('direct Autonomous device endpoint selection', () => {
     // Graceful close (not terminate) so a pair.revoke frame queued just before is flushed to the device.
     await vi.waitFor(() => expect(closed).toEqual([1000]))
   })
-  it('pairs a device the caller just picked even when the next mDNS browse misses it', async () => {
+  it('pairs a device just selected even when the next mDNS browse misses it', async () => {
     const f = await fixture()
-    // Prime the candidates map the way a routine `discover` call would (the
-    // Desktop app polls every ~63s, so a device the user just picked from the
-    // list is always in the map).
     await f.direct.discover()
-    // The very next browse — the one pair() runs internally — comes back empty:
-    // one flaky bonjour-service round on macOS misses the answer inside the
-    // 3s window, though the device is still reachable at the address we saved.
     f.discovery.mockResolvedValueOnce([])
     expect(await f.direct.pair(f.row.id, 'CODE12')).toMatchObject({ state: 'paired', fingerprint: f.fp })
   })

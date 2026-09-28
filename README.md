@@ -119,6 +119,15 @@ harness remote-password set
 harness start
 ```
 
+**In a terminal:** the same line installs `hn` — tmux's keys and your `~/.tmux.conf`, with every
+harness on every machine ([hn](tui/README.md)). The first time, `hn` signs in and connects the
+computer:
+
+```bash
+curl -fsSL https://harness.autonomous.ai/cli/install.sh | bash
+hn
+```
+
 <details>
 <summary><b>Build from source</b></summary>
 
@@ -256,6 +265,10 @@ Press **⌘N → Hello World** and say hello. The [authoring guide](store/README
 
 ## Harness device
 
+[**Get a Harness device**](https://www.autonomous.ai/harness-device), or build your own from the files below. The
+[firmware guide](devices/harness-device/firmware/README.md) lists the supported boards and build
+commands, and the [hardware guide](devices/harness-device/hardware/README.md) covers the design files.
+
 <p align="center"><img src=".github/assets/readme/device.gif" width="960" alt="A finger taps the round Harness device, speaks a task to fix the login flow, and the device shows the agent deploying, then a summary of the shipped fix."></p>
 
 The optional **Harness device** is a round, always-on display that sits beside
@@ -271,14 +284,11 @@ It is open hardware, all the way down. This repository has everything it takes t
 | [PCB](devices/harness-device/hardware/pcb/) | The EasyEDA Pro project, the schematic, Gerbers, the bill of materials, and pick-and-place data for assembly. |
 | [Enclosure](devices/harness-device/hardware/3d/) | STEP for editing and STL for printing: the housing, an iron counterweight base, the USB clamp, and the button. |
 
-[**Get a Harness device**](https://www.autonomous.ai/harness), or build your own from these files. The
-[firmware guide](devices/harness-device/firmware/README.md) lists the supported boards and build
-commands, and the [hardware guide](devices/harness-device/hardware/README.md) covers the design files.
-
 ## Contribute
 
 Make a harness for a tool you love. Improve terminals, engines, the daemon or the relay. Port the
 firmware. Start with the [contribution guide](CONTRIBUTING.md).
 
+[Architecture](docs/architecture.md) · [Product direction (proposal)](docs/product-direction.md) ·
 [Development](docs/development.md) · [Extending](docs/extending.md) · [CLI](docs/cli.md) ·
 [Security](SECURITY.md) · [MIT license](LICENSE); upstream tools keep their own.
