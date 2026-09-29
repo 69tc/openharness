@@ -314,34 +314,21 @@ async fn run(config: config::Config) -> io::Result<()> {
             if !found { if !ipc::alive(f.socket.as_deref(), f.name.as_deref()) { eprintln!("can't find session: {t}") } std::process::exit(1) }
         }
     }
-    // Refuse to start a client from inside an existing hn client — as tmux
-    // refuses `tmux` from inside a tmux pane. Without this, `hn` (and `harness
-    // tui`, which wraps `hn`) inside a pane would open a whole TUI on top of
-    // itself, tail-eating the parent's screen until the process tree gives up.
-    // Detection matches ipc::chosen's own rule: $TMUX's socket path pointing at
-    // hn's socket directory means the parent process is a client of ours. Match
-    // tmux's exact wording so tmux-savvy users read the same escape hatch:
-    // `TMUX= hn` (or `unset TMUX; hn`) bypasses.
+    // Refuse to start a client from inside an existing multiplexer session —
+    // as tmux itself does. Without this, `hn` (and `harness tui`, which wraps
+    // `hn`) opened inside a pane stacks a whole TUI on top of the parent's
+    // screen; when the parent multiplexer is hn, the recursion keeps going
+    // until the process tree gives up, and when it's a real tmux (for
+    // instance, the tmux backend that Harness Desktop uses to host its
+    // terminals), the pane borders and status bars overlap into a cascade
+    // that reads as an infinite loop to the user.
     //
-    // macOS symlinks /tmp -> /private/tmp; the parent client stores the
-    // canonical form in $TMUX (…/private/tmp/hn-<uid>/…) while ipc::dir()
-    // returns either flavour depending on TMPDIR. Normalise both by stripping
-    // a leading /private so a compare in either flavour catches the nesting.
-    fn strip_macos_private(p: &std::path::Path) -> std::path::PathBuf {
-        let s = p.to_string_lossy();
-        if let Some(rest) = s.strip_prefix("/private/") {
-            std::path::PathBuf::from(format!("/{rest}"))
-        } else {
-            p.to_path_buf()
-        }
-    }
-    let hn_dir_norm = strip_macos_private(&ipc::dir());
-    if std::env::var("TMUX").ok()
-        .and_then(|t| t.split(',').next().map(std::path::PathBuf::from))
-        .map(|p| strip_macos_private(&p))
-        .filter(|p| p.starts_with(&hn_dir_norm))
-        .is_some()
-    {
+    // Follow tmux's own rule: any $TMUX at all is a nested-client signal.
+    // The message and the escape hatch stay tmux's exact wording so muscle
+    // memory carries over: `TMUX= hn` (or `unset TMUX; hn`) bypasses when the
+    // caller truly wants a nested client, matching tmux's `unset $TMUX to
+    // force`.
+    if std::env::var("TMUX").ok().filter(|t| !t.is_empty()).is_some() {
         eprintln!("sessions should be nested with care, unset $TMUX to force");
         std::process::exit(1);
     }
