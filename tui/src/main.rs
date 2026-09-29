@@ -322,9 +322,24 @@ async fn run(config: config::Config) -> io::Result<()> {
     // hn's socket directory means the parent process is a client of ours. Match
     // tmux's exact wording so tmux-savvy users read the same escape hatch:
     // `TMUX= hn` (or `unset TMUX; hn`) bypasses.
+    //
+    // macOS symlinks /tmp -> /private/tmp; the parent client stores the
+    // canonical form in $TMUX (…/private/tmp/hn-<uid>/…) while ipc::dir()
+    // returns either flavour depending on TMPDIR. Normalise both by stripping
+    // a leading /private so a compare in either flavour catches the nesting.
+    fn strip_macos_private(p: &std::path::Path) -> std::path::PathBuf {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("/private/") {
+            std::path::PathBuf::from(format!("/{rest}"))
+        } else {
+            p.to_path_buf()
+        }
+    }
+    let hn_dir_norm = strip_macos_private(&ipc::dir());
     if std::env::var("TMUX").ok()
         .and_then(|t| t.split(',').next().map(std::path::PathBuf::from))
-        .filter(|p| p.starts_with(ipc::dir()))
+        .map(|p| strip_macos_private(&p))
+        .filter(|p| p.starts_with(&hn_dir_norm))
         .is_some()
     {
         eprintln!("sessions should be nested with care, unset $TMUX to force");
